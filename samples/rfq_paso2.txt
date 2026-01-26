@@ -1,0 +1,3 @@
+10 cable THHN #12 rojo
+50 abrazadera EMT 3/4
+tubo EMT 1" x 3 metros
