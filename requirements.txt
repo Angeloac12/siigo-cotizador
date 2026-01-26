@@ -28,3 +28,4 @@ pandas
 openpyxl
 openai>=1.0.0
 psycopg[binary]>=3.1
+python-multipart
