@@ -17,9 +17,20 @@ from app.db import db_ping
 from dotenv import load_dotenv
 from app.api.routes_quote_drafts import router as quote_drafts_router
 from app.services.document_extractor import DocumentExtractor
+
+
+
+
+
 load_dotenv()
 _SIIGO_TOKEN_CACHE = {"token": None, "exp": 0}
 _SIIGO_TOKEN_LOCK = threading.Lock()
+
+def _sanitize_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    # Elimina cualquier byte NUL que rompe PostgreSQL
+    return value.replace("\x00", "")
 def _jwt_exp(token: str) -> int:
     try:
         payload = token.split(".")[1]
