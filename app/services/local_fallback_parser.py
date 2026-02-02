@@ -54,32 +54,98 @@ def _infer_uom(token: Optional[str]) -> Optional[Uom]:
 
 
 def _extract_qty_uom_desc(raw: str):
-    warnings = []
-    raw_clean = _BULLET_PREFIX_RE.sub("", raw.strip())
+    warnings: List[str] = []
+    raw_clean = _BULLET_PREFIX_RE.sub("", (raw or "").strip())
 
-    qty = None
-    uom = None
-    uom_raw = None
+    # --------------------------
+    # 0) Formato fuerte del frontend:
+    # QTY=2 | DESC=Rollo cable No. 12 x 100 m - Rojo
+    # --------------------------
+    m = re.match(
+        r"^\s*QTY\s*=\s*(\d+(?:[.,]\d+)?)\s*\|\s*DESC\s*=\s*(.+?)\s*$",
+        raw_clean,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        qty = _to_float(m.group(1)) or 1.0
+        desc = (m.group(2) or "").strip()
+        if qty <= 0:
+            qty = 1.0
+            warnings.append("QTY_INFERRED")
+        # uom por defecto
+        return float(qty), Uom.UND, desc, warnings, 0.85, None
+
+    qty: Optional[float] = None
+    uom: Optional[Uom] = None
+    uom_raw: Optional[str] = None
     desc = raw_clean
 
-    # qty al inicio: "10 cable THHN..."
-    m = re.match(r"^(\d+(?:[.,]\d+)?)\s*(?:x\s*)?([A-Za-zñÑ\.]+)?\s*(.+)$", raw_clean)
+    # --------------------------
+    # 1) Cantidad al final con unidad:
+    # "Cable #500 Cu/THHN – 370 unidades"
+    # "Borna ... - 2 und"
+    # --------------------------
+    m = re.match(
+        r"^(.*?)(?:\s*[-–—]\s*)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
+        raw_clean,
+    )
     if m:
-        qty = _to_float(m.group(1))
-        token_raw = (m.group(2) or "").strip()
-        token = token_raw.lower().strip(".")
-        rest = (m.group(3) or "").strip()
+        left = (m.group(1) or "").strip()
+        qty2 = _to_float(m.group(2))
+        unit_raw = (m.group(3) or "").strip()
+        maybe_uom = _infer_uom(unit_raw)
 
-        maybe_uom = _infer_uom(token)
-
-        if maybe_uom is not None:
+        if qty2 is not None and qty2 > 0 and maybe_uom is not None:
+            qty = qty2
             uom = maybe_uom
-            uom_raw = token_raw
-            desc = rest
-        else:
-            # NO era unidad -> es parte de la descripción
-            desc = f"{token_raw} {rest}".strip() if token_raw else rest
+            uom_raw = unit_raw
+            desc = left
 
+    # --------------------------
+    # 2) Cantidad al final con "x":
+    # "Lampara 18W x 34"
+    # --------------------------
+    if qty is None:
+        m = re.match(r"^(.*?)(?:\s*[xX]\s*)(\d+(?:[.,]\d+)?)\s*$", raw_clean)
+        if m:
+            left = (m.group(1) or "").strip()
+            qty2 = _to_float(m.group(2))
+            if qty2 is not None and qty2 > 0:
+                qty = qty2
+                uom = Uom.UND
+                desc = left
+
+    # --------------------------
+    # 3) Cantidad al inicio:
+    # "10 cable THHN..."
+    # "10 mts cable #8"
+    # "2 rollos cable #12"
+    # "6und x 60cm - MANGUERA ..."
+    # --------------------------
+    if qty is None:
+        m = re.match(r"^(\d+(?:[.,]\d+)?)\s*(?:x\s*)?([A-Za-zñÑ\.]+)?\s*(.+)$", raw_clean)
+        if m:
+            qty3 = _to_float(m.group(1))
+            token_raw = (m.group(2) or "").strip()
+            rest = (m.group(3) or "").strip()
+
+            if qty3 is not None and qty3 > 0:
+                qty = qty3
+
+                token = token_raw.lower().strip(".")
+                maybe_uom = _infer_uom(token)
+
+                if maybe_uom is not None:
+                    uom = maybe_uom
+                    uom_raw = token_raw
+                    desc = rest
+                else:
+                    # token NO es unidad -> hace parte de la descripción
+                    desc = f"{token_raw} {rest}".strip() if token_raw else rest
+
+    # --------------------------
+    # Defaults + limpieza
+    # --------------------------
     if qty is None or qty <= 0:
         qty = 1.0
         warnings.append("QTY_INFERRED")
@@ -93,13 +159,17 @@ def _extract_qty_uom_desc(raw: str):
         desc2 = raw_clean
         warnings.append("DESCRIPTION_FALLBACK")
 
+    # Confidence
     conf = 0.4
     if "QTY_INFERRED" not in warnings and "UOM_INFERRED" not in warnings:
-        conf = 0.75
+        conf = 0.78
     elif "QTY_INFERRED" in warnings and "UOM_INFERRED" in warnings:
         conf = 0.35
 
     return float(qty), uom, desc2, warnings, conf, uom_raw
+
+
+
 
 
 

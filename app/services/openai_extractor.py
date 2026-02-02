@@ -87,11 +87,31 @@ class OpenAIExtractor:
             },
         )
 
-        out_text = getattr(resp, "output_text", None)
-        if not out_text:
-            out_text = ""
 
-        data = json.loads(out_text) if out_text else {}
+
+        out_text = getattr(resp, "output_text", None) or ""
+
+        try:
+            data = json.loads(out_text) if out_text else {}
+        except json.JSONDecodeError as e:
+            # OJO: esto NO debe reventar el flujo; devolvemos ExtractionResult vacío
+            res = ExtractionResult(
+                items=[],
+                global_warnings=[
+                    "OPENAI_FAILED",
+                    "OPENAI_ERROR_JSONDecodeError",
+                ],
+                meta={
+                    "extractor": "openai",
+                    "model": self.model,
+                    "source_type": source_type,
+                    "openai_error_class": e.__class__.__name__,
+                    "openai_error_message": str(e)[:300],
+                    "openai_output_chars": len(out_text),
+                    "openai_output_head": out_text[:250],
+                },
+            )
+            return res
 
         # 1) Normalización de unidades, etc.
         data = self._normalize_before_validation(data)
@@ -127,6 +147,7 @@ class OpenAIExtractor:
         res.global_warnings = res.global_warnings or []
         return res
 
+    
     def _normalize_before_validation(self, data: dict) -> dict:
         """
         Ajusta el JSON crudo de OpenAI para que pase la validación Pydantic.
@@ -145,15 +166,20 @@ class OpenAIExtractor:
             if not isinstance(it, dict):
                 continue
 
+            # ✅ 1) RECORTES DEFENSIVOS (EVITA JSON ENORME)
+            if isinstance(it.get("raw_text"), str):
+                it["raw_text"] = it["raw_text"].replace("\x00", "")[:160]
+            if isinstance(it.get("description"), str):
+                it["description"] = it["description"].replace("\x00", "")[:160]
+
+            # ✅ 2) NORMALIZAR UOM
             uom = it.get("uom")
             if isinstance(uom, str):
                 uom_upper = uom.upper()
 
                 if uom_upper not in allowed_uom:
-                    # guardar el original en uom_raw si no estaba
                     if not it.get("uom_raw"):
                         it["uom_raw"] = uom
-                    # setear uom normalizada
                     it["uom"] = "UND"
 
         return data
@@ -245,6 +271,8 @@ class OpenAIExtractor:
             "- global_warnings es una lista de strings (puede ir vacía).\n"
             "- meta es un objeto libre (el sistema lo completará con detalles internos).\n"
             "\n"
+            "- raw_text debe ser la línea original pero recortada a máximo 160 caracteres.\n"
+            "- description debe ser máximo 160 caracteres.\n"
             "Formato de salida:\n"
             "- Devuelve SOLO un JSON válido que cumpla exactamente el schema indicado.\n"
             "- Cada item debe incluir: line_index, raw_text, description, quantity, uom, uom_raw, confidence, warnings_json.\n"
@@ -259,6 +287,7 @@ class OpenAIExtractor:
             "- Ignora por completo filas de totales, subtotales, IVA, retenciones, 'Total a Pagar' y similares.\n"
             "- No conviertas precios ni valores de dinero en quantity.\n"
             "- Si una línea no tiene cantidad explícita, asume quantity=1.\n\n"
+            "- Si los valores tienen . o coma debes ponerlos en valores enteros"
             f"TEXTO:\n{text}"
         )
 
