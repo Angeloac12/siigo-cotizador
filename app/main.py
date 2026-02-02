@@ -15,8 +15,11 @@ from sqlalchemy import create_engine
 from app.upstream_gateway.factory import get_gateway
 from app.db import db_ping
 from dotenv import load_dotenv
+##from app.api.routes_siigo_catalog import router as siigo_catalog_router
 from app.api.routes_quote_drafts import router as quote_drafts_router
 from app.services.document_extractor import DocumentExtractor
+
+
 
 load_dotenv()
 _SIIGO_TOKEN_CACHE = {"token": None, "exp": 0}
@@ -44,6 +47,7 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 app = FastAPI(title="SiigoCotizador", version="0.1.0")
+##app.include_router(siigo_catalog_router)
 app.include_router(quote_drafts_router)
 
 def new_correlation_id() -> str:
@@ -360,16 +364,21 @@ def _engine_or_get_engine():
 
 @app.post("/v1/drafts/{draft_id}/quote/preview")
 def quote_preview(draft_id: str, body: dict = Body(default=None)):
+    """
+    Preview del payload para Siigo SIN llamar a Siigo.
+
+    Regla:
+    - NO autocompleta customer_identification: debe venir desde UI (popup si falta).
+    - document_id y seller deben venir desde UI (dropdowns).
+    - price sale de default_price (para pruebas). En real debe ser > 0.
+    """
     body = body or {}
     eng = _engine_or_get_engine()
 
+    # 1) Cargar draft (solo columnas que sí existen)
     with eng.connect() as conn:
         draft = conn.execute(
-            text("""
-                SELECT id, status, client_document_type, client_document_number
-                FROM drafts
-                WHERE id = :id
-            """),
+            text("SELECT id, status, warnings_json FROM drafts WHERE id = :id"),
             {"id": draft_id},
         ).mappings().first()
 
@@ -386,33 +395,30 @@ def quote_preview(draft_id: str, body: dict = Body(default=None)):
             {"draft_id": draft_id},
         ).mappings().all()
 
+    # 2) Inputs que DEBEN venir del UI
+    customer_identification = (body.get("customer_identification") or "").strip()
+    document_id = int(body.get("document_id") or 0)
+    seller_id = int(body.get("seller") or 0)
+    customer_branch_office = int(body.get("customer_branch_office") or 0)
+
     default_item_code = str(body.get("item_code", "2543"))
-    default_price = body.get("default_price", 0)
-
-    customer_identification = (
-        body.get("customer_identification")
-        or draft.get("client_document_number")
-        or None
-    )
-
-    customer_branch_office = body.get("customer_branch_office", 0)
-    document_id = body.get("document_id") or int(os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
-    seller_id = body.get("seller") or int(os.getenv("SIIGO_SELLER_ID", "0") or "0")
+    default_price = float(body.get("default_price") or 0)
 
     warnings = []
 
     if not customer_identification:
-        warnings.append({"code": "MISSING_CUSTOMER_IDENTIFICATION", "message": "Falta customer.identification (NIT/CC) para Siigo."})
+        warnings.append({"code": "MISSING_CUSTOMER_IDENTIFICATION", "message": "Falta NIT/CC del cliente. El UI debe pedirlo (popup)."})
     if not document_id:
-        warnings.append({"code": "MISSING_DOCUMENT_ID", "message": "Falta document.id (tipo comprobante) para Siigo. Envia body.document_id o set SIIGO_QUOTE_DOCUMENT_ID."})
+        warnings.append({"code": "MISSING_DOCUMENT_ID", "message": "Falta document_id. El UI debe enviarlo desde dropdown (documentos Siigo)."})
     if not seller_id:
-        warnings.append({"code": "MISSING_SELLER_ID", "message": "Falta seller (id vendedor) para Siigo. Envia body.seller o set SIIGO_SELLER_ID."})
-    if not default_price or float(default_price) == 0:
-        warnings.append({"code": "PRICE_IS_ZERO", "message": "items.price está en 0. Siigo exige price > 0 al crear cotización. Envia body.default_price para pruebas o define la regla."})
+        warnings.append({"code": "MISSING_SELLER_ID", "message": "Falta seller. El UI debe enviarlo desde dropdown."})
+    if default_price <= 0:
+        warnings.append({"code": "PRICE_IS_ZERO", "message": "items.price está en 0. Para enviar real a Siigo necesitas price > 0."})
 
+    # 3) Construir items
     siigo_items = []
     for it in items:
-        desc = (it.get("description") or "").strip()
+        desc = (it.get("description") or "").strip() or (it.get("raw_text") or "").strip()
         qty = it.get("quantity") or 0
         try:
             qty = float(qty)
@@ -420,28 +426,23 @@ def quote_preview(draft_id: str, body: dict = Body(default=None)):
             qty = 0
 
         if not desc:
-            desc = (it.get("raw_text") or "").strip()
+            warnings.append({"code": "EMPTY_ITEM_DESCRIPTION", "message": f"Línea {it.get('line_index')} sin descripción."})
 
-        if not desc:
-            warnings.append({"code": "EMPTY_ITEM_DESCRIPTION", "message": f"Linea {it.get('line_index')} sin descripción."})
-
-        siigo_items.append(
-            {
-                "code": default_item_code,
-                "description": desc,
-                "quantity": qty,
-                "price": default_price,
-            }
-        )
+        siigo_items.append({
+            "code": default_item_code,
+            "description": desc,
+            "quantity": qty,
+            "price": default_price,
+        })
 
     payload = {
         "document": {"id": document_id},
         "date": str(date.today()),
         "customer": {
             "identification": customer_identification,
-            "branch_office": int(customer_branch_office),
+            "branch_office": customer_branch_office,
         },
-        "seller": int(seller_id),
+        "seller": seller_id,
         "items": siigo_items,
     }
 
@@ -450,10 +451,6 @@ def quote_preview(draft_id: str, body: dict = Body(default=None)):
         "draft_status": draft.get("status"),
         "siigo_quote_payload": payload,
         "warnings": warnings,
-        "notes": {
-            "item_code_rule": "items.code fijo=2543 por ahora",
-            "price_rule": "price está en default_price (0 por defecto). Para enviar real a Siigo toca precio > 0 o pedirlo al vendedor / calcularlo.",
-        },
     }
 
 
@@ -537,7 +534,7 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
 
 class QuoteCommitRequest(BaseModel):
     customer_identification: Optional[str] = None
-    document_id: Optional[int] = None
+    document_id: int | None = None
     seller: Optional[int] = None
     branch_office: int = 0
     default_price: float = 0
@@ -621,7 +618,7 @@ async def commit_quote(draft_id: str, request: Request):
     with engine.connect() as conn:
         draft = conn.execute(
             text("""
-                SELECT id, status, warnings_json, client_document_number
+                SELECT id, status, warnings_json
                 FROM drafts
                 WHERE id=:id
             """),
@@ -647,9 +644,9 @@ async def commit_quote(draft_id: str, request: Request):
     # -------------------------
     # 2) Completar defaults SI NO VINIERON del UI
     # -------------------------
-    customer_identification = body.customer_identification or draft.get("client_document_number") or None
-    document_id = body.document_id or int(os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
-    seller_id = body.seller or int(os.getenv("SIIGO_SELLER_ID", "0") or "0")
+    customer_identification = (body.customer_identification or "").strip() or None
+    document_id = int(body.document_id or os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
+    seller_id = int(body.seller or os.getenv("SIIGO_SELLER_ID", "0") or "0")
 
     missing = []
     if not customer_identification:
@@ -699,6 +696,9 @@ async def commit_quote(draft_id: str, request: Request):
                 "price": float(body.default_price),
             }
         )
+    
+    if document_id <= 0:
+        raise HTTPException(status_code=409, detail={"code": "MISSING_DOCUMENT_ID"})
 
     quote_payload = {
         "document": {"id": int(document_id)},
