@@ -125,8 +125,11 @@ async def submit_quote_draft(
 async def process_quote_draft(
     request: Request,
     file: UploadFile = File(...),
+
+    # ✅ soporta payload JSON string
     payload: Optional[str] = Form(None),
 
+    # ✅ soporta campos sueltos (lo actual)
     customer_identification: Optional[str] = Form(None),
     document_id: Optional[int] = Form(None),
     seller: Optional[int] = Form(None),
@@ -138,7 +141,7 @@ async def process_quote_draft(
     customer_create_payload: Optional[str] = Form(None),
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
-    # ---- payload fallback ----
+    # ---- 0) payload fallback (si viene) ----
     if payload:
         try:
             p = _json.loads(payload)
@@ -146,24 +149,25 @@ async def process_quote_draft(
                 customer_identification = customer_identification or p.get("customer_identification")
                 document_id = document_id or p.get("document_id")
                 seller = seller or p.get("seller")
-                branch_office = branch_office or p.get("branch_office", 0)
-                default_price = default_price or p.get("default_price", 0)
+
+                branch_office = p.get("branch_office", branch_office)
+                default_price = p.get("default_price", default_price)
                 dry_run = p.get("dry_run", dry_run)
                 create_customer_if_missing = p.get("create_customer_if_missing", create_customer_if_missing)
+
                 if not customer_create_payload and p.get("customer_create_payload"):
                     customer_create_payload = _json.dumps(p["customer_create_payload"])
         except Exception:
             raise HTTPException(status_code=400, detail="payload must be valid JSON string")
 
-    # Validación final (para que no vuelva el 422 y sea claro)
+    # ✅ validación dura ANTES de upload/parse (evita tu 400)
     missing = []
     if not customer_identification: missing.append("customer_identification")
     if not document_id: missing.append("document_id")
     if not seller: missing.append("seller")
     if missing:
-        raise HTTPException(status_code=422, detail={"code":"MISSING_FIELDS", "missing": missing})
+        raise HTTPException(status_code=422, detail={"code": "MISSING_FIELDS", "missing": missing})
 
-    
     # 1) upload
     upload_json = await _proxy(
         request,
@@ -177,9 +181,9 @@ async def process_quote_draft(
     # 2) parse
     parse_json = await _proxy(request, "POST", f"/v1/drafts/{draft_id}/parse", x_api_key)
 
-    # 3) build submit payload (AQUÍ estaba el bug: no estábamos pasando create_customer_if_missing + payload)
+    # 3) submit payload (nunca null)
     submit_payload: Dict[str, Any] = {
-        "customer_identification": customer_identification,
+        "customer_identification": str(customer_identification),
         "document_id": int(document_id),
         "seller": int(seller),
         "branch_office": int(branch_office),
@@ -194,7 +198,7 @@ async def process_quote_draft(
         except Exception:
             raise HTTPException(status_code=400, detail="customer_create_payload must be valid JSON string")
 
-    # 4) submit
+    # 4) commit
     submit_json = await _proxy(
         request,
         "POST",
@@ -203,9 +207,4 @@ async def process_quote_draft(
         json=submit_payload,
     )
 
-    return {
-        "draft_id": draft_id,
-        "upload": upload_json,
-        "parse": parse_json,
-        "submit": submit_json,
-    }
+    return {"draft_id": draft_id, "upload": upload_json, "parse": parse_json, "submit": submit_json}
