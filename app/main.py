@@ -644,7 +644,10 @@ async def commit_quote(draft_id: str, request: Request):
     # -------------------------
     # 2) Completar defaults SI NO VINIERON del UI
     # -------------------------
-    customer_identification = (body.customer_identification or "").strip() or None
+    customer_identification = (body.customer_identification or "").strip()
+    if not customer_identification:
+        raise HTTPException(status_code=400, detail={"code":"MISSING_CUSTOMER_IDENTIFICATION"})
+
     document_id = int(body.document_id or os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
     seller_id = int(body.seller or os.getenv("SIIGO_SELLER_ID", "0") or "0")
 

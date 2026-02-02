@@ -2,6 +2,9 @@ from fastapi import APIRouter, Request, UploadFile, File, Header, HTTPException,
 import httpx
 from typing import Any, Dict, Optional
 import json as _json
+import logging
+logger = logging.getLogger("uvicorn.error")
+
 
 router = APIRouter(prefix="/v1/quote-drafts", tags=["quote-drafts"])
 ERROR_MESSAGES = {
@@ -125,15 +128,9 @@ async def submit_quote_draft(
 async def process_quote_draft(
     request: Request,
     file: UploadFile = File(...),
-
-    # ✅ soporta payload JSON string
-    payload: Optional[str] = Form(None),
-
-    # ✅ soporta campos sueltos (lo actual)
-    customer_identification: Optional[str] = Form(None),
-    document_id: Optional[int] = Form(None),
-    seller: Optional[int] = Form(None),
-
+    customer_identification: str = Form(...),
+    document_id: int = Form(...),
+    seller: int = Form(...),
     branch_office: int = Form(0),
     default_price: float = Form(0),
     dry_run: bool = Form(True),
@@ -141,32 +138,20 @@ async def process_quote_draft(
     customer_create_payload: Optional[str] = Form(None),
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
-    # ---- 0) payload fallback (si viene) ----
-    if payload:
-        try:
-            p = _json.loads(payload)
-            if isinstance(p, dict):
-                customer_identification = customer_identification or p.get("customer_identification")
-                document_id = document_id or p.get("document_id")
-                seller = seller or p.get("seller")
+    # ✅ Lee el archivo UNA sola vez (y valida que no esté vacío)
+    file_bytes = await file.read()
+    file_len = len(file_bytes or b"")
+    ct = file.content_type or "application/octet-stream"
 
-                branch_office = p.get("branch_office", branch_office)
-                default_price = p.get("default_price", default_price)
-                dry_run = p.get("dry_run", dry_run)
-                create_customer_if_missing = p.get("create_customer_if_missing", create_customer_if_missing)
-
-                if not customer_create_payload and p.get("customer_create_payload"):
-                    customer_create_payload = _json.dumps(p["customer_create_payload"])
-        except Exception:
-            raise HTTPException(status_code=400, detail="payload must be valid JSON string")
-
-    # ✅ validación dura ANTES de upload/parse (evita tu 400)
-    missing = []
-    if not customer_identification: missing.append("customer_identification")
-    if not document_id: missing.append("document_id")
-    if not seller: missing.append("seller")
-    if missing:
-        raise HTTPException(status_code=422, detail={"code": "MISSING_FIELDS", "missing": missing})
+    if file_len == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "EMPTY_FILE",
+                "message": "El archivo llegó vacío al backend. Revisa el envío desde la UI/Edge Function.",
+                "debug": {"filename": file.filename, "content_type": ct, "bytes": file_len},
+            },
+        )
 
     # 1) upload
     upload_json = await _proxy(
@@ -174,16 +159,35 @@ async def process_quote_draft(
         "POST",
         "/v1/drafts/upload",
         x_api_key,
-        files={"file": (file.filename, await file.read(), file.content_type or "application/octet-stream")},
+        files={"file": (file.filename, file_bytes, ct)},
     )
     draft_id = upload_json["draft_id"]
 
     # 2) parse
     parse_json = await _proxy(request, "POST", f"/v1/drafts/{draft_id}/parse", x_api_key)
 
-    # 3) submit payload (nunca null)
+    # ✅ SI parse no creó ítems, paramos AQUÍ (no intentamos commit)
+    items_created = int(parse_json.get("items_created") or 0)
+    if items_created <= 0:
+        logger.warning(
+            "NO_ITEMS_EXTRACTED draft_id=%s filename=%s bytes=%s",
+            draft_id,
+            file.filename,
+            file_len,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NO_ITEMS_EXTRACTED",
+                "message": "No se detectaron ítems con cantidad en el archivo/texto. Pega las líneas con cantidades (ej: 'Rollo cable #12 - 2 unidades' o 'x 2').",
+                "debug": {"draft_id": draft_id, "filename": file.filename, "content_type": ct, "bytes": file_len},
+                "parse": parse_json,
+            },
+        )
+
+    # 3) build submit payload
     submit_payload: Dict[str, Any] = {
-        "customer_identification": str(customer_identification),
+        "customer_identification": customer_identification,
         "document_id": int(document_id),
         "seller": int(seller),
         "branch_office": int(branch_office),
@@ -198,7 +202,7 @@ async def process_quote_draft(
         except Exception:
             raise HTTPException(status_code=400, detail="customer_create_payload must be valid JSON string")
 
-    # 4) commit
+    # 4) submit
     submit_json = await _proxy(
         request,
         "POST",
@@ -207,4 +211,9 @@ async def process_quote_draft(
         json=submit_payload,
     )
 
-    return {"draft_id": draft_id, "upload": upload_json, "parse": parse_json, "submit": submit_json}
+    return {
+        "draft_id": draft_id,
+        "upload": upload_json,
+        "parse": parse_json,
+        "submit": submit_json,
+    }
