@@ -534,10 +534,11 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
     return {"draft_id": draft_id, "status": "PARSED", "items_saved": len(payload.items)}
 
 
+
 class QuoteCommitRequest(BaseModel):
-    customer_identification: str
-    document_id: int
-    seller: int
+    customer_identification: Optional[str] = None
+    document_id: Optional[int] = None
+    seller: Optional[int] = None
     branch_office: int = 0
     default_price: float = 0
 
@@ -554,7 +555,7 @@ async def commit_quote(draft_id: str, request: Request):
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("X-Correlation-Id") or ""
 
     # -------------------------
-    # 0) Leer body (JSON o FORM) y validarlo con QuoteCommitRequest
+    # 0) Leer body (JSON o FORM) y validar
     # -------------------------
     content_type = (request.headers.get("content-type") or "").lower()
 
@@ -566,12 +567,12 @@ async def commit_quote(draft_id: str, request: Request):
             form = await request.form()
             raw = dict(form)
 
-            # convertir booleans si vienen como strings
+            # booleans
             for k in ["dry_run", "create_customer_if_missing"]:
                 if k in raw and isinstance(raw[k], str):
                     raw[k] = raw[k].lower() in ("1", "true", "yes", "y", "on")
 
-            # convertir números si vienen como strings
+            # ints
             for k in ["document_id", "seller", "branch_office"]:
                 if k in raw and isinstance(raw[k], str) and raw[k].strip():
                     try:
@@ -579,23 +580,21 @@ async def commit_quote(draft_id: str, request: Request):
                     except Exception:
                         pass
 
-            for k in ["default_price"]:
-                if k in raw and isinstance(raw[k], str) and raw[k].strip():
-                    try:
-                        raw[k] = float(raw[k])
-                    except Exception:
-                        pass
+            # floats
+            if "default_price" in raw and isinstance(raw["default_price"], str) and raw["default_price"].strip():
+                try:
+                    raw["default_price"] = float(raw["default_price"])
+                except Exception:
+                    pass
 
-            # convertir customer_create_payload si viene como string JSON
+            # json string -> dict
             if "customer_create_payload" in raw and raw["customer_create_payload"]:
                 if isinstance(raw["customer_create_payload"], str):
                     try:
                         raw["customer_create_payload"] = json.loads(raw["customer_create_payload"])
                     except Exception:
                         pass
-
         else:
-            # fallback: intentar como form
             form = await request.form()
             raw = dict(form)
 
@@ -605,7 +604,6 @@ async def commit_quote(draft_id: str, request: Request):
     try:
         body = QuoteCommitRequest.model_validate(raw)
     except Exception as e:
-        # Pydantic v2: ValidationError trae .errors(), pero no siempre
         errs = None
         if hasattr(e, "errors"):
             try:
@@ -614,12 +612,127 @@ async def commit_quote(draft_id: str, request: Request):
                 errs = None
         raise HTTPException(
             status_code=400,
-            detail={"code": "COMMIT_VALIDATION_FAILED", "errors": errs or str(e)[:300]},
+            detail={"code": "COMMIT_VALIDATION_FAILED", "errors": errs or str(e)[:300], "received_keys": list(raw.keys())},
         )
 
     # -------------------------
-    # helpers (idénticos a los tuyos)
+    # 1) Leer draft + items (IMPORTANTE: traer client_document_number)
     # -------------------------
+    with engine.connect() as conn:
+        draft = conn.execute(
+            text("""
+                SELECT id, status, warnings_json, client_document_number
+                FROM drafts
+                WHERE id=:id
+            """),
+            {"id": draft_id},
+        ).mappings().first()
+
+        if not draft:
+            raise HTTPException(status_code=404, detail="Draft not found")
+
+        rows = conn.execute(
+            text("""
+                SELECT line_index, raw_text, description, quantity, uom
+                FROM draft_items
+                WHERE draft_id=:id
+                ORDER BY line_index
+            """),
+            {"id": draft_id},
+        ).mappings().all()
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="Draft has no items. Parse first or PUT items.")
+
+    # -------------------------
+    # 2) Completar defaults SI NO VINIERON del UI
+    # -------------------------
+    customer_identification = body.customer_identification or draft.get("client_document_number") or None
+    document_id = body.document_id or int(os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
+    seller_id = body.seller or int(os.getenv("SIIGO_SELLER_ID", "0") or "0")
+
+    missing = []
+    if not customer_identification:
+        missing.append("customer_identification (or drafts.client_document_number)")
+    if not document_id:
+        missing.append("document_id (or SIIGO_QUOTE_DOCUMENT_ID)")
+    if not seller_id:
+        missing.append("seller (or SIIGO_SELLER_ID)")
+
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "MISSING_REQUIRED_FIELDS",
+                "missing": missing,
+                "hint": "Envía estos campos desde UI o configúralos en drafts/ENV para que el backend complete.",
+            },
+        )
+
+    # -------------------------
+    # 3) Idempotencia (si ya está COMMITTED y no es dry_run)
+    # -------------------------
+    if (
+        (draft.get("status") == "COMMITTED"
+         or (isinstance(draft.get("warnings_json"), dict) and draft.get("warnings_json").get("siigo_quote_response")))
+        and not body.dry_run
+    ):
+        w = draft.get("warnings_json") or {}
+        siigo_saved = w.get("siigo_quote_response")
+        return {
+            "draft_id": draft_id,
+            "status": "COMMITTED",
+            "siigo_quote_response": siigo_saved,
+            "note": "Already committed (idempotent). Not calling Siigo again.",
+        }
+
+    # -------------------------
+    # 4) Armar items (code fijo 2543)
+    # -------------------------
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append(
+            {
+                "code": "2543",
+                "description": r["description"],
+                "quantity": float(r["quantity"]),
+                "price": float(body.default_price),
+            }
+        )
+
+    quote_payload = {
+        "document": {"id": int(document_id)},
+        "date": str(date.today()),
+        "customer": {"identification": str(customer_identification), "branch_office": int(body.branch_office)},
+        "seller": int(seller_id),
+        "items": items,
+    }
+
+    # -------------------------
+    # 5) Dry-run
+    # -------------------------
+    if body.dry_run:
+        return {
+            "draft_id": draft_id,
+            "draft_status": draft["status"],
+            "dry_run": True,
+            "siigo_quote_payload": quote_payload,
+            "notes": {
+                "defaults_used": {
+                    "customer_identification": str(customer_identification),
+                    "document_id": int(document_id),
+                    "seller": int(seller_id),
+                }
+            },
+        }
+
+    # -------------------------
+    # 6) Llamada real a Siigo (+ autocreate si aplica)
+    # -------------------------
+    gw = get_gateway()
+    customer_created: Optional[Dict[str, Any]] = None
+
+    # helper functions (los mismos tuyos)
     def _is_customer_missing_siigo(http_exc: HTTPException) -> bool:
         detail = http_exc.detail
         if isinstance(detail, str):
@@ -656,27 +769,19 @@ async def commit_quote(draft_id: str, request: Request):
                 cur = cur[key]
             return cur is not None and cur != "" and cur != []
 
-        if not has("person_type"):
-            missing.append("person_type")
-        if not has("id_type"):
-            missing.append("id_type")
-        if not has("identification"):
-            missing.append("identification")
-        if not has("name"):
-            missing.append("name")
+        if not has("person_type"): missing.append("person_type")
+        if not has("id_type"): missing.append("id_type")
+        if not has("identification"): missing.append("identification")
+        if not has("name"): missing.append("name")
 
         fr = payload.get("fiscal_responsibilities")
         if not isinstance(fr, list) or not fr or not isinstance(fr[0], dict) or not fr[0].get("code"):
             missing.append("fiscal_responsibilities[0].code")
 
-        if not has("address.address"):
-            missing.append("address.address")
-        if not has("address.city.country_code"):
-            missing.append("address.city.country_code")
-        if not has("address.city.state_code"):
-            missing.append("address.city.state_code")
-        if not has("address.city.city_code"):
-            missing.append("address.city.city_code")
+        if not has("address.address"): missing.append("address.address")
+        if not has("address.city.country_code"): missing.append("address.city.country_code")
+        if not has("address.city.state_code"): missing.append("address.city.state_code")
+        if not has("address.city.city_code"): missing.append("address.city.city_code")
 
         contacts = payload.get("contacts")
         if not isinstance(contacts, list) or not contacts or not isinstance(contacts[0], dict) or not contacts[0].get("first_name"):
@@ -684,140 +789,12 @@ async def commit_quote(draft_id: str, request: Request):
 
         return missing
 
-    # 1) leer draft + items
-    with engine.connect() as conn:
-        draft = conn.execute(
-            text("SELECT id, status, warnings_json FROM drafts WHERE id=:id"),
-            {"id": draft_id},
-        ).mappings().first()
-
-        if not draft:
-            raise HTTPException(status_code=404, detail="Draft not found")
-
-        rows = conn.execute(
-            text("""
-                SELECT line_index, raw_text, description, quantity, uom
-                FROM draft_items
-                WHERE draft_id=:id
-                ORDER BY line_index
-            """),
-            {"id": draft_id},
-        ).mappings().all()
-
-    if not rows:
-        raise HTTPException(status_code=400, detail="Draft has no items. Parse first or PUT items.")
-
-    # ✅ 1.5) IDempotencia: si ya está COMMITTED y NO es dry_run, no llames a Siigo otra vez
-    if (
-        (draft.get("status") == "COMMITTED"
-         or (isinstance(draft.get("warnings_json"), dict) and draft.get("warnings_json").get("siigo_quote_response")))
-        and not body.dry_run
-    ):
-        w = draft.get("warnings_json") or {}
-        siigo_saved = w.get("siigo_quote_response")
-        return {
-            "draft_id": draft_id,
-            "status": "COMMITTED",
-            "siigo_quote_response": siigo_saved,
-            "note": "Already committed (idempotent). Not calling Siigo again.",
-        }
-
-    # 2) armar items (code fijo 2543)
-    items: List[Dict[str, Any]] = []
-    for r in rows:
-        items.append(
-            {
-                "code": "2543",
-                "description": r["description"],
-                "quantity": float(r["quantity"]),
-                "price": float(body.default_price),
-            }
-        )
-
-    quote_payload = {
-        "document": {"id": body.document_id},
-        "date": str(date.today()),
-        "customer": {"identification": body.customer_identification, "branch_office": body.branch_office},
-        "seller": body.seller,
-        "items": items,
-    }
-
-    # 3) dry-run
-    if body.dry_run:
-        return {
-            "draft_id": draft_id,
-            "draft_status": draft["status"],
-            "dry_run": True,
-            "siigo_quote_payload": quote_payload,
-            "notes": {
-                "item_code_rule": "items.code fijo=2543 por ahora",
-                "customer_rule": "customer.identification = NIT/CC",
-                "to_call_siigo": "Activa Siigo y envía dry_run=false",
-            },
-        }
-
-    # 4) upstream (gateway)
-    gw = get_gateway()
-    customer_created: Optional[Dict[str, Any]] = None
-
-    # ✅ 1.6) Idempotencia por X-Correlation-Id (para /process)
-    if correlation_id and not body.dry_run:
-        with engine.connect() as conn:
-            prev = conn.execute(
-                text("""
-                    SELECT id, warnings_json
-                    FROM drafts
-                    WHERE status='COMMITTED'
-                      AND (warnings_json->>'correlation_id') = :corr
-                      AND id <> :id
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                """),
-                {"corr": correlation_id, "id": draft_id},
-            ).mappings().first()
-
-        if prev:
-            w = prev.get("warnings_json") or {}
-            prev_resp = w.get("siigo_quote_response")
-
-            if prev_resp:
-                up_client_id = str((prev_resp.get("customer") or {}).get("id") or "")
-
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            UPDATE drafts
-                            SET status='COMMITTED',
-                                updated_at=now(),
-                                upstream_client_id = COALESCE(NULLIF(upstream_client_id, ''), :up_client_id),
-                                warnings_json = COALESCE(warnings_json, '{}'::jsonb) || CAST(:meta AS jsonb)
-                            WHERE id=:id
-                        """),
-                        {
-                            "id": draft_id,
-                            "up_client_id": up_client_id,
-                            "meta": json.dumps({
-                                "siigo_quote_response": prev_resp,
-                                "correlation_id": correlation_id,
-                                "note": "Idempotent by correlation_id. Reused previous Siigo quotation."
-                            }),
-                        },
-                    )
-
-                return {
-                    "draft_id": draft_id,
-                    "status": "COMMITTED",
-                    "upstream_client_id": up_client_id,
-                    "siigo_quote_response": prev_resp,
-                    "note": "Idempotent by correlation_id. Reused previous Siigo quotation.",
-                }
-
     try:
         quote_resp = gw.create_quote(
-            customer_identification=body.customer_identification,
-            branch_office=body.branch_office,
-            document_id=body.document_id,
-            seller=body.seller,
+            customer_identification=str(customer_identification),
+            branch_office=int(body.branch_office),
+            document_id=int(document_id),
+            seller=int(seller_id),
             items=items,
             date_iso=str(date.today()),
         )
@@ -830,42 +807,27 @@ async def commit_quote(draft_id: str, request: Request):
             raise HTTPException(status_code=409, detail={"code": "CLIENT_NOT_FOUND"})
 
         if not body.customer_create_payload:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]},
-            )
+            raise HTTPException(status_code=409, detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]})
 
         missing_fields = _validate_customer_payload(body.customer_create_payload)
         if missing_fields:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields},
-            )
+            raise HTTPException(status_code=409, detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields})
 
-        log.info(
-            "customer_auto_create_attempt",
-            extra={"correlation_id": correlation_id, "customer_identification": body.customer_identification},
-        )
-
+        log.info("customer_auto_create_attempt", extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)})
         customer_created = gw.create_client(body.customer_create_payload)
-
-        log.info(
-            "customer_auto_create_success",
-            extra={"correlation_id": correlation_id, "customer_identification": body.customer_identification},
-        )
+        log.info("customer_auto_create_success", extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)})
 
         time.sleep(1)
 
         quote_resp = gw.create_quote(
-            customer_identification=body.customer_identification,
-            branch_office=body.branch_office,
-            document_id=body.document_id,
-            seller=body.seller,
+            customer_identification=str(customer_identification),
+            branch_office=int(body.branch_office),
+            document_id=int(document_id),
+            seller=int(seller_id),
             items=items,
             date_iso=str(date.today()),
         )
 
-    # 5) marcar draft como COMMITTED
     up_client_id = ""
     if isinstance(customer_created, dict):
         up_client_id = str(customer_created.get("id") or "")
