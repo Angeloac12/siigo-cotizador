@@ -30,7 +30,7 @@ class OpenAIExtractor:
         self.client = OpenAI()
         # Por defecto usamos gpt-4.1-mini para extracción
         self.model = os.getenv("OPENAI_MODEL_EXTRACTOR", "gpt-4.1-mini")
-        self.max_output_tokens = _min_tokens(int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "900")))
+        self.max_output_tokens = _min_tokens(int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2500")))
         self.temperature = float(os.getenv("OPENAI_TEMPERATURE", "0"))
 
     # -------------------------
