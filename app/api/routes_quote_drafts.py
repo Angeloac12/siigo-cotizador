@@ -120,13 +120,17 @@ async def submit_quote_draft(
     return await _proxy(request, "POST", f"/v1/drafts/{draft_id}/quote/commit", x_api_key, json=payload)
 
 
+
 @router.post("/process")
 async def process_quote_draft(
     request: Request,
     file: UploadFile = File(...),
-    customer_identification: str = Form(...),
-    document_id: int = Form(...),
-    seller: int = Form(...),
+    payload: Optional[str] = Form(None),
+
+    customer_identification: Optional[str] = Form(None),
+    document_id: Optional[int] = Form(None),
+    seller: Optional[int] = Form(None),
+
     branch_office: int = Form(0),
     default_price: float = Form(0),
     dry_run: bool = Form(True),
@@ -134,6 +138,32 @@ async def process_quote_draft(
     customer_create_payload: Optional[str] = Form(None),
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
+    # ---- payload fallback ----
+    if payload:
+        try:
+            p = _json.loads(payload)
+            if isinstance(p, dict):
+                customer_identification = customer_identification or p.get("customer_identification")
+                document_id = document_id or p.get("document_id")
+                seller = seller or p.get("seller")
+                branch_office = branch_office or p.get("branch_office", 0)
+                default_price = default_price or p.get("default_price", 0)
+                dry_run = p.get("dry_run", dry_run)
+                create_customer_if_missing = p.get("create_customer_if_missing", create_customer_if_missing)
+                if not customer_create_payload and p.get("customer_create_payload"):
+                    customer_create_payload = _json.dumps(p["customer_create_payload"])
+        except Exception:
+            raise HTTPException(status_code=400, detail="payload must be valid JSON string")
+
+    # Validación final (para que no vuelva el 422 y sea claro)
+    missing = []
+    if not customer_identification: missing.append("customer_identification")
+    if not document_id: missing.append("document_id")
+    if not seller: missing.append("seller")
+    if missing:
+        raise HTTPException(status_code=422, detail={"code":"MISSING_FIELDS", "missing": missing})
+
+    
     # 1) upload
     upload_json = await _proxy(
         request,
