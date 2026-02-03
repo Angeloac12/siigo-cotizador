@@ -9,6 +9,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from app.schemas.extraction import ExtractionResult
+from app.services.local_fallback_parser import fallback_enabled, fallback_txt_lines_to_extraction
 
 
 def _min_tokens(v: int) -> int:
@@ -47,10 +48,13 @@ class OpenAIExtractor:
 
         # <= 40 líneas: normal
         if len(lines) <= 40:
+            raw = "\n".join(lines)
             return self._call_openai(
-                user_content=[{"type": "input_text", "text": self._prompt_for_text("\n".join(lines))}],
+                user_content=[{"type": "input_text", "text": self._prompt_for_text(raw)}],
                 source_type="txt",
+                fallback_text=raw,
             )
+
 
         # > 40 líneas: chunk de 40, combinamos resultados
         all_items = []
@@ -62,7 +66,9 @@ class OpenAIExtractor:
             res = self._call_openai(
                 user_content=[{"type": "input_text", "text": self._prompt_for_text(chunk)}],
                 source_type="txt",
+                fallback_text=chunk,
             )
+
 
             # reindex (para mantener orden global)
             for it in (res.items or []):
@@ -111,8 +117,14 @@ class OpenAIExtractor:
     # -------------------------
     # Internals
     # -------------------------
-    def _call_openai(self, user_content: list[dict], source_type: str) -> ExtractionResult:
+    def _call_openai(
+        self,
+        user_content: list[dict],
+        source_type: str,
+        fallback_text: Optional[str] = None,
+    ) -> ExtractionResult:
         resp = self.client.responses.create(
+
             model=self.model,
             input=[
                 {"role": "system", "content": self._system_prompt()},
@@ -130,46 +142,78 @@ class OpenAIExtractor:
             },
         )
 
-
-
         out_text = getattr(resp, "output_text", None) or ""
+
+        # helper local (queda DENTRO de _call_openai)
+        def _maybe_fallback(
+            reason: str,
+            extra_warnings: Optional[List[str]] = None,
+            extra_meta: Optional[Dict[str, Any]] = None,
+        ) -> Optional[ExtractionResult]:
+            if not (fallback_enabled() and fallback_text and source_type == "txt"):
+                return None
+
+            fb = fallback_txt_lines_to_extraction(fallback_text)
+            if not fb.items:
+                return None
+
+            fb.global_warnings = (
+                (extra_warnings or [])
+                + ["FALLBACK_LOCAL_USED", reason]
+                + (fb.global_warnings or [])
+            )
+            fb.meta = {
+                **(fb.meta or {}),
+                "source_type": source_type,
+                "fallback_reason": reason,
+                "openai_model": self.model,
+                **(extra_meta or {}),
+            }
+            return fb
 
         try:
             data = json.loads(out_text) if out_text else {}
+
         except json.JSONDecodeError as e:
-            # OJO: esto NO debe reventar el flujo; devolvemos ExtractionResult vacío
-            res = ExtractionResult(
+            extra_meta = {
+                "extractor": "openai",
+                "model": self.model,
+                "openai_error_class": e.__class__.__name__,
+                "openai_error_message": str(e)[:300],
+                "openai_output_chars": len(out_text),
+                "openai_output_head": out_text[:250],
+            }
+
+            fb_res = _maybe_fallback(
+                reason="OPENAI_ERROR_JSONDecodeError",
+                extra_warnings=["OPENAI_FAILED", "OPENAI_ERROR_JSONDecodeError"],
+                extra_meta=extra_meta,
+            )
+            if fb_res:
+                return fb_res
+
+            return ExtractionResult(
                 items=[],
-                global_warnings=[
-                    "OPENAI_FAILED",
-                    "OPENAI_ERROR_JSONDecodeError",
-                ],
+                global_warnings=["OPENAI_FAILED", "OPENAI_ERROR_JSONDecodeError"],
                 meta={
                     "extractor": "openai",
                     "model": self.model,
                     "source_type": source_type,
-                    "openai_error_class": e.__class__.__name__,
-                    "openai_error_message": str(e)[:300],
-                    "openai_output_chars": len(out_text),
-                    "openai_output_head": out_text[:250],
+                    **extra_meta,
                 },
             )
-            return res
 
         # 1) Normalización de unidades, etc.
         data = self._normalize_before_validation(data)
 
-        # 2) Intentar validar; si Pydantic se queja, limpiamos items y reintentamos
+        # 2) Validación Pydantic con limpieza
         try:
             res = self._validate_extraction_result(data)
         except ValidationError as e1:
-            # limpieza adicional: eliminar items con descripción vacía o quantity <= 0
             data_clean = self._cleanup_items_for_validation(data)
-
             try:
                 res = self._validate_extraction_result(data_clean)
             except ValidationError as e2:
-                # último recurso: no lanzar excepción, devolver resultado vacío
                 res = ExtractionResult(
                     items=[],
                     global_warnings=[
@@ -180,7 +224,7 @@ class OpenAIExtractor:
                     meta={},
                 )
 
-        # meta mínima garantizada (se complementa, no se borra)
+        # meta mínima garantizada
         res.meta = {
             **(res.meta or {}),
             "extractor": "openai",
@@ -188,7 +232,19 @@ class OpenAIExtractor:
             "source_type": source_type,
         }
         res.global_warnings = res.global_warnings or []
+
+        # ✅ Si OpenAI devolvió 0 items, intentamos fallback (solo txt + flag)
+        if (not res.items) and (source_type == "txt"):
+            fb_res = _maybe_fallback(
+                reason="OPENAI_NO_ITEMS",
+                extra_warnings=(res.global_warnings or []) + ["OPENAI_NO_ITEMS"],
+                extra_meta={"extractor": "openai", "model": self.model},
+            )
+            if fb_res:
+                return fb_res
+
         return res
+
 
     
     def _normalize_before_validation(self, data: dict) -> dict:
