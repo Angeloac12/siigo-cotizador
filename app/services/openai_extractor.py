@@ -36,11 +36,54 @@ class OpenAIExtractor:
     # -------------------------
     # Public API
     # -------------------------
+    ##def normalize_from_text(self, text: str) -> ExtractionResult:
+      ##  return self._call_openai(
+        ##    user_content=[{"type": "input_text", "text": self._prompt_for_text(text)}],
+          ##  source_type="txt",
+       ## )
     def normalize_from_text(self, text: str) -> ExtractionResult:
-        return self._call_openai(
-            user_content=[{"type": "input_text", "text": self._prompt_for_text(text)}],
-            source_type="txt",
-        )
+        # Si el texto viene largo (muchas líneas), lo partimos para que NO se corte el JSON.
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+
+        # <= 40 líneas: normal
+        if len(lines) <= 40:
+            return self._call_openai(
+                user_content=[{"type": "input_text", "text": self._prompt_for_text("\n".join(lines))}],
+                source_type="txt",
+            )
+
+        # > 40 líneas: chunk de 40, combinamos resultados
+        all_items = []
+        all_warnings = []
+        meta = {"extractor": "openai", "model": self.model, "source_type": "txt"}
+
+        for start in range(0, len(lines), 40):
+            chunk = "\n".join(lines[start:start + 40])
+            res = self._call_openai(
+                user_content=[{"type": "input_text", "text": self._prompt_for_text(chunk)}],
+                source_type="txt",
+            )
+
+            # reindex (para mantener orden global)
+            for it in (res.items or []):
+                try:
+                    it.line_index = int(it.line_index) + start
+                except Exception:
+                    pass
+
+            all_items.extend(res.items or [])
+            all_warnings.extend(res.global_warnings or [])
+
+        # dedup warnings sin perder orden
+        seen = set()
+        dedup_warnings = []
+        for w in all_warnings:
+            if w not in seen:
+                seen.add(w)
+                dedup_warnings.append(w)
+
+        return ExtractionResult(items=all_items, global_warnings=dedup_warnings, meta=meta)
+
 
     def normalize_from_table(self, table_text: str) -> ExtractionResult:
         return self._call_openai(
