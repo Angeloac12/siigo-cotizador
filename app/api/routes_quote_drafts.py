@@ -13,6 +13,17 @@ ERROR_MESSAGES = {
 }
 
 
+def _timeout_for_path(path: str) -> httpx.Timeout:
+    # Ajusta según tu realidad:
+    # - upload: rápido
+    # - parse: puede tardar ~90s+ cuando OpenAI se pone lento
+    # - commit: medio
+    if path.endswith("/parse"):
+        return httpx.Timeout(180.0, connect=10.0, read=180.0, write=30.0, pool=10.0)
+    if path.endswith("/upload"):
+        return httpx.Timeout(60.0, connect=10.0, read=60.0, write=30.0, pool=10.0)
+    return httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
+
 def _base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
@@ -32,14 +43,42 @@ async def _proxy(
     if corr:
         headers["X-Correlation-Id"] = corr
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.request(
-            method,
-            url,
-            headers=headers,
-            files=files,
-            json=json,
-        )
+    
+        
+    timeout = _timeout_for_path(path)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
+            resp = await client.request(
+                method,
+                url,
+                headers=headers,
+                files=files,
+                json=json,
+            )
+        except httpx.TimeoutException:
+            # Evita 500; deja un error claro para UI/Edge
+            raise HTTPException(
+                status_code=504,
+                detail={
+                    "code": "UPSTREAM_TIMEOUT",
+                    "message": "El backend tardó demasiado procesando (parse lento). Intenta de nuevo.",
+                    "debug": {
+                        "path": path,
+                        "timeout_s": getattr(timeout, "read", None) or "unknown",
+                    },
+                },
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "UPSTREAM_REQUEST_ERROR",
+                    "message": "Error de red llamando al backend.",
+                    "debug": {"path": path, "error": str(e)[:200]},
+                },
+            )
+
 
     if resp.status_code >= 400:
         try:
