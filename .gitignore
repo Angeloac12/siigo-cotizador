@@ -6,3 +6,17 @@ __pycache__/
 data/
 uploads/
 ./data/uploads/
+# macOS
+.DS_Store
+
+# QA / local test artifacts
+*_out.json
+backend_out.json
+edge_out.json
+repro_out.json
+retest_out.json
+retest_fallback_out.json
+load_results*.txt
+times_*.txt
+cotizacion_test.txt
+edge_*.sh

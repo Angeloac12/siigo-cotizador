@@ -1,14 +1,18 @@
 # app/services/local_fallback_parser.py
 from __future__ import annotations
-
+import os
 import re
 from typing import List, Optional, Tuple
 
 from app.schemas.extraction import ExtractionResult, ExtractedItem, Uom
 
+def fallback_enabled() -> bool:
+    return os.getenv("ENABLE_FALLBACK_REGEX", "true").lower() in ("1", "true", "yes", "y")
+
 _UOM_ALIASES = {
+    
     # UND
-    "und": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND, "pza": Uom.UND, "pzas": Uom.UND,
+    "und": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND, "pza": Uom.UND, "pzas": Uom.UND,"unidades": Uom.UND, "uds": Uom.UND, "unds": Uom.UND,
     # M
     "m": Uom.M, "mt": Uom.M, "mts": Uom.M, "mtr": Uom.M, "mtrs": Uom.M, "metro": Uom.M, "metros": Uom.M,
     # KG
@@ -32,14 +36,22 @@ _UOM_ALIASES = {
 _BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]+\s*")
 
 
+
 def _to_float(s: str) -> Optional[float]:
     s = (s or "").strip()
     if not s:
         return None
-    s = s.replace(",", ".")
+
+    # 1.234,56 -> 1234.56
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    # 1,5 -> 1.5
+    elif "," in s:
+        s = s.replace(",", ".")
+    # 1200 o 12.5 quedan igual
+
     try:
-        v = float(s)
-        return v
+        return float(s)
     except Exception:
         return None
 
@@ -187,6 +199,10 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
             break
 
         qty, uom, desc, warnings, conf, uom_raw = _extract_qty_uom_desc(ln)
+
+        # Si qty y uom fueron inferidos (no venían en el texto), es una línea dudosa.
+        if "QTY_INFERRED" in warnings and "UOM_INFERRED" in warnings and conf < 0.5:
+            continue
 
         items.append(
             ExtractedItem(
