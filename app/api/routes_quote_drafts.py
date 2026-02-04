@@ -3,6 +3,8 @@ import httpx
 from typing import Any, Dict, Optional
 import json as _json
 import logging
+from app.services.local_fallback_parser import fallback_enabled, fallback_txt_lines_to_extraction
+
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -65,7 +67,7 @@ async def _proxy(
                     "message": "El backend tardó demasiado procesando (parse lento). Intenta de nuevo.",
                     "debug": {
                         "path": path,
-                        "timeout_s": getattr(timeout, "read", None) or "unknown",
+                        "timeout_s": getattr(timeout, "read", timeout) if timeout is not None else "unknown",
                     },
                 },
             )
@@ -182,6 +184,13 @@ async def process_quote_draft(
     file_len = len(file_bytes or b"")
     ct = file.content_type or "application/octet-stream"
 
+    raw_text = ""
+    try:
+        raw_text = file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        raw_text = ""
+
+    
     if file_len == 0:
         raise HTTPException(
             status_code=400,
@@ -205,24 +214,70 @@ async def process_quote_draft(
     # 2) parse
     parse_json = await _proxy(request, "POST", f"/v1/drafts/{draft_id}/parse", x_api_key)
 
-    # ✅ SI parse no creó ítems, paramos AQUÍ (no intentamos commit)
+    
     items_created = int(parse_json.get("items_created") or 0)
+
     if items_created <= 0:
-        logger.warning(
-            "NO_ITEMS_EXTRACTED draft_id=%s filename=%s bytes=%s",
-            draft_id,
-            file.filename,
-            file_len,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "NO_ITEMS_EXTRACTED",
-                "message": "No se detectaron ítems con cantidad en el archivo/texto. Pega las líneas con cantidades (ej: 'Rollo cable #12 - 2 unidades' o 'x 2').",
-                "debug": {"draft_id": draft_id, "filename": file.filename, "content_type": ct, "bytes": file_len},
-                "parse": parse_json,
-            },
-        )
+        # 2A) intentar fallback local con el mismo texto
+        if fallback_enabled() and raw_text.strip():
+            fb = fallback_txt_lines_to_extraction(raw_text)
+
+            if fb.items:
+                items_payload = {
+                    "items": [
+                        {
+                            "line_index": i,
+                            "raw_text": it.raw_text,
+                            "description": it.description,
+                            "quantity": it.quantity,
+                            "uom": it.uom.value,  # enum -> "UND", "M", etc
+                            "uom_raw": it.uom_raw,
+                            "confidence": it.confidence,
+                            "warnings": it.warnings,
+                        }
+                        for i, it in enumerate(fb.items)
+                    ]
+                }
+
+                # 2B) persistir ítems en el draft para que el commit funcione
+                await _proxy(
+                    request,
+                    "PUT",
+                    f"/v1/drafts/{draft_id}/items",
+                    x_api_key,
+                    json=items_payload,
+                )
+
+                # 2C) “simular” un parse exitoso para respuesta/telemetría
+                parse_json = {
+                    "items_created": len(fb.items),
+                    "warnings": ["FALLBACK_LOCAL_USED", "OPENAI_EMPTY_ITEMS"],
+                    "meta": {"source_type": "txt", "extractor": "local", "model": "local-fallback-v1"},
+                    "items": items_payload["items"],
+                }
+
+            else:
+                logger.warning("NO_ITEMS_EXTRACTED draft_id=%s filename=%s bytes=%s", draft_id, file.filename, file_len)
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "NO_ITEMS_EXTRACTED",
+                        "message": "No se detectaron ítems con cantidad en el archivo/texto.",
+                        "debug": {"draft_id": draft_id, "filename": file.filename, "content_type": ct, "bytes": file_len},
+                        "parse": parse_json,
+                    },
+                )
+        else:
+            logger.warning("NO_ITEMS_EXTRACTED draft_id=%s filename=%s bytes=%s", draft_id, file.filename, file_len)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "NO_ITEMS_EXTRACTED",
+                    "message": "No se detectaron ítems con cantidad en el archivo/texto.",
+                    "debug": {"draft_id": draft_id, "filename": file.filename, "content_type": ct, "bytes": file_len},
+                    "parse": parse_json,
+                },
+            )
 
     # 3) build submit payload
     submit_payload: Dict[str, Any] = {

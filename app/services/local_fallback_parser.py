@@ -109,7 +109,7 @@ def _extract_qty_uom_desc(raw: str):
         left = (m.group(1) or "").strip()
         qty2 = _to_float(m.group(2))
         unit_raw = (m.group(3) or "").strip()
-        paren_raw = (m.group(4) or "").strip() if m.group(4) else ""
+        paren_raw = (m.group(4) or "").strip() if (getattr(m, "lastindex", 0) or 0) >= 4 else ""
 
         maybe_uom = _infer_uom(unit_raw)
         paren_uom = _infer_uom(paren_raw) if paren_raw else None
