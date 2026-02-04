@@ -1,0 +1,40 @@
+from app.services.local_fallback_parser import fallback_txt_lines_to_extraction
+
+TXT = """Cinta autofundente #23 2 unid
+Cinta color amarilla 1 unid
+Cinta color azul 1 unid
+Cinta color roja 1 unid
+Cinta color verde 1 unid
+Cinta color naranja 1 unid
+Cinta color café 1 unid
+Cinta color blanca 1 unid
+Varilla copperweld 4 unid
+Cepillo de acero 1 unid
+Cable desnudo 2/0 AWG 30 unid
+Cargas Cadweld de 150 1 unid
+Gas MAPP (Prestolite) con boquilla 1 unid
+Controlador de varilla a tierra SDS Plus 5/8" 1 unid
+Caja de inspección plástica para puesta a tierra 1 unid
+Sunchadora 1 unid
+Cinta Bandit 3/4" 1 unid
+Hebillas para cinta Bandit 3/4" 1 unid
+Acometida eléctrica cable 4/0 AWG aluminio S8000 THHN (4 líneas 380 + 190 + 240 V) 3240 unid
+Armario eléctrico para dos tensiones (440 y 220 Vca + banco de capacitores) 1 unid
+Totalizador principal 440 Vca 250 Amp 1 unid
+Totalizador auxiliar 440 Vca 150 Amp 1 unid
+Totalizador auxiliar 440 Vca 50 Amp 1 unid
+Totalizador principal 230 Vca 250 Amp 1 unid
+Totalizador auxiliar 230 Vca 125 Amp 1 unid
+Totalizador auxiliar 230 Vca 80 Amp 1 unid
+Totalizador auxiliar 230 Vca 50 Amp 1 unid
+Terminal ponchable de ojo 4/0 AWG 24 unid
+Terminal ponchable de ojo 1/0 AWG 36 unid
+Terminal ponchable de ojo 4 AWG 24 unid
+Terminal ponchable de ojo 10 AWG 36 unid
+"""
+
+def test_fallback_parses_all_lines():
+    res = fallback_txt_lines_to_extraction(TXT)
+    assert len(res.items) == 31
+    assert res.items[0].quantity == 2
+    assert res.items[0].description.lower().startswith("cinta autofundente")
