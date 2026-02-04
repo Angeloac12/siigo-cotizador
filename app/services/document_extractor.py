@@ -76,42 +76,39 @@ class DocumentExtractor:
         if source_type == "txt":
             text = open(source_path, "r", encoding="utf-8", errors="ignore").read()
 
+            # 0) Siempre correr parser local primero (rápido y estable)
+            local_res = fallback_txt_lines_to_extraction(text)
+            local_res.meta = {**(local_res.meta or {}), "extractor": "local", "model": "local-fallback-v1", "source_type": "txt"}
+
+            # Heurística simple: si local ya encontró items suficientes -> NO OpenAI (MVP/demo)
+            min_items = int(os.getenv("LOCAL_FIRST_MIN_ITEMS", "1"))
+            if len(local_res.items) >= min_items:
+                local_res.global_warnings = (local_res.global_warnings or []) + ["LOCAL_FIRST_USED", "SKIPPED_OPENAI"]
+                return self._enforce_max_items(local_res)
+
+            # 1) Si local NO encontró items, ahí sí intenta OpenAI (si está habilitado)
             if self._openai_enabled():
                 try:
                     from app.services.openai_extractor import OpenAIExtractor  # lazy import
                     res = OpenAIExtractor().normalize_from_text(text)
-                    res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
-                
-                
+                    res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model, "source_type": "txt"}
+                    return self._enforce_max_items(res)
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(text)
-                    res.global_warnings = (res.global_warnings or []) + [
+                    # 2) Si OpenAI falla, devolvemos local (aunque sea vacío) con warnings claros
+                    local_res.global_warnings = (local_res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
                         "FALLBACK_LOCAL_USED",
                     ]
-                    res.meta = {
-                        **(res.meta or {}),
-                        "extractor": "local",
-                        "model": "local-fallback-v1",
-                        "openai_error_class": e.__class__.__name__,
-                        "openai_error_message": str(e),
-                        "fallback_used": True,
-                    }
-
-                    res.meta = {
-                        **(res.meta or {}),
-                        "extractor": "local",
-                        "model": "local-fallback-v1",
+                    local_res.meta = {
+                        **(local_res.meta or {}),
                         "openai_error_class": e.__class__.__name__,
                         "openai_error_message": str(e),
                     }
-            else:
-                res = fallback_txt_lines_to_extraction(text)
-                res.meta = {**(res.meta or {}), "extractor": "local", "model": "local-fallback-v1"}
+                    return self._enforce_max_items(local_res)
 
-            res.meta = {**(res.meta or {}), "source_type": "txt"}
-            return self._enforce_max_items(res)
+            # OpenAI deshabilitado
+            return self._enforce_max_items(local_res)
 
         # ---------------- CSV ----------------
         if source_type == "csv":
