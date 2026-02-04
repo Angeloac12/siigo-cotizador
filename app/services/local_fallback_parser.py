@@ -12,7 +12,8 @@ def fallback_enabled() -> bool:
 _UOM_ALIASES = {
     
     # UND
-    "und": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND, "pza": Uom.UND, "pzas": Uom.UND,"unidades": Uom.UND, "uds": Uom.UND, "unds": Uom.UND,
+    "und": Uom.UND, "unid": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND, "pza": Uom.UND, "pzas": Uom.UND, "unidades": Uom.UND, "uds": Uom.UND, "unds": Uom.UND, "unid": Uom.UND, "unid.": Uom.UND, "unids": Uom.UND,
+
     # M
     "m": Uom.M, "mt": Uom.M, "mts": Uom.M, "mtr": Uom.M, "mtrs": Uom.M, "metro": Uom.M, "metros": Uom.M,
     # KG
@@ -91,27 +92,77 @@ def _extract_qty_uom_desc(raw: str):
     uom: Optional[Uom] = None
     uom_raw: Optional[str] = None
     desc = raw_clean
-
+    
     # --------------------------
-    # 1) Cantidad al final con unidad:
-    # "Cable #500 Cu/THHN – 370 unidades"
+    # 1) Cantidad al final con unidad (con o sin guion) + paréntesis opcional:
+    # "Cinta ... 2 unid"
     # "Borna ... - 2 und"
+    # "Hebillas ... 1 unid (paquete)"
+    # "Cable ... 30 unid (metros)"
     # --------------------------
     m = re.match(
-        r"^(.*?)(?:\s*[-–—]\s*)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
+        r"^(.*?)(?:\s*[-–—]\s*|\s+)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
         raw_clean,
     )
+
     if m:
         left = (m.group(1) or "").strip()
         qty2 = _to_float(m.group(2))
         unit_raw = (m.group(3) or "").strip()
-        maybe_uom = _infer_uom(unit_raw)
+        paren_raw = (m.group(4) or "").strip() if m.group(4) else ""
 
-        if qty2 is not None and qty2 > 0 and maybe_uom is not None:
+        maybe_uom = _infer_uom(unit_raw)
+        paren_uom = _infer_uom(paren_raw) if paren_raw else None
+
+        if qty2 is not None and qty2 > 0:
             qty = qty2
-            uom = maybe_uom
-            uom_raw = unit_raw
             desc = left
+            uom_raw = unit_raw
+
+            # 1) unidad directa
+            if maybe_uom is not None:
+                uom = maybe_uom
+
+                # si la unidad es genérica (UND) y el paréntesis sugiere otra unidad (metros, etc) => preferimos paréntesis
+                if uom == Uom.UND and paren_uom is not None and paren_uom != uom:
+                    uom = paren_uom
+                    warnings.append("UOM_FROM_PAREN")
+                    uom_raw = f"{unit_raw}({paren_raw})"
+
+            # 2) unidad no reconocida, pero paréntesis sí
+            elif paren_uom is not None:
+                uom = paren_uom
+                warnings.append("UOM_FROM_PAREN")
+                uom_raw = f"{unit_raw}({paren_raw})"
+
+            # 3) nada reconocido => UND sin romper
+            else:
+                uom = Uom.UND
+                warnings.append("UOM_INFERRED")
+
+            # si hay paréntesis y no lo usamos como unidad, lo dejamos en desc como calificador
+            if paren_raw and "UOM_FROM_PAREN" not in warnings:
+                desc = f"{desc} ({paren_raw})".strip()
+    # --------------------------
+    # 1b) Cantidad al final con unidad (SIN guion):
+    # "Cinta autofundente #23 2 unid"
+    # --------------------------
+    if qty is None:
+        m = re.match(
+            r"^(.*?)(?:\s+)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
+            raw_clean,
+        )
+        if m:
+            left = (m.group(1) or "").strip()
+            qty2 = _to_float(m.group(2))
+            unit_raw = (m.group(3) or "").strip()
+            maybe_uom = _infer_uom(unit_raw)
+
+            if qty2 is not None and qty2 > 0 and maybe_uom is not None:
+                qty = qty2
+                uom = maybe_uom
+                uom_raw = unit_raw
+                desc = left
 
     # --------------------------
     # 2) Cantidad al final con "x":
@@ -206,7 +257,7 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
 
         items.append(
             ExtractedItem(
-                line_index=len(items),
+                line_index=idx,
                 raw_text=ln,
                 description=desc,
                 quantity=qty,
@@ -222,6 +273,8 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
         global_warnings=global_warnings or None,
         meta={"source_type": "txt", "extractor": "local", "model": "local-fallback-v1"},
     )
+
+
 
 
 def fallback_table_text_to_extraction(table_text: str, source_type: str, max_items: int = 200) -> ExtractionResult:
