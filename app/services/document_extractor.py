@@ -81,12 +81,24 @@ class DocumentExtractor:
                     from app.services.openai_extractor import OpenAIExtractor  # lazy import
                     res = OpenAIExtractor().normalize_from_text(text)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
+                
+                
                 except Exception as e:
                     res = fallback_txt_lines_to_extraction(text)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
+                        "FALLBACK_LOCAL_USED",
                     ]
+                    res.meta = {
+                        **(res.meta or {}),
+                        "extractor": "local",
+                        "model": "local-fallback-v1",
+                        "openai_error_class": e.__class__.__name__,
+                        "openai_error_message": str(e),
+                        "fallback_used": True,
+                    }
+
                     res.meta = {
                         **(res.meta or {}),
                         "extractor": "local",
@@ -116,12 +128,23 @@ class DocumentExtractor:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().normalize_from_table(table_text)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
+
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(table_text)
+                    res = fallback_txt_lines_to_extraction(text)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
+                        "FALLBACK_LOCAL_USED",
                     ]
+                    res.meta = {
+                        **(res.meta or {}),
+                        "extractor": "local",
+                        "model": "local-fallback-v1",
+                        "openai_error_class": e.__class__.__name__,
+                        "openai_error_message": str(e),
+                        "fallback_used": True,
+                    }
+
                     res.meta = {
                         **(res.meta or {}),
                         "extractor": "local",
@@ -153,12 +176,23 @@ class DocumentExtractor:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().normalize_from_table(table_text)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
+                
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(table_text)
+                    res = fallback_txt_lines_to_extraction(text)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
+                        "FALLBACK_LOCAL_USED",
                     ]
+                    res.meta = {
+                        **(res.meta or {}),
+                        "extractor": "local",
+                        "model": "local-fallback-v1",
+                        "openai_error_class": e.__class__.__name__,
+                        "openai_error_message": str(e),
+                        "fallback_used": True,
+                    }
+
                     res.meta = {
                         **(res.meta or {}),
                         "extractor": "local",
@@ -199,12 +233,23 @@ class DocumentExtractor:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().extract_from_pdf(pdf_path)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
+                
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(f"[uploaded pdf: {filename or 'document.pdf'}]")
+                    res = fallback_txt_lines_to_extraction(text)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
+                        "FALLBACK_LOCAL_USED",
                     ]
+                    res.meta = {
+                        **(res.meta or {}),
+                        "extractor": "local",
+                        "model": "local-fallback-v1",
+                        "openai_error_class": e.__class__.__name__,
+                        "openai_error_message": str(e),
+                        "fallback_used": True,
+                    }
+
                     res.meta = {
                         **(res.meta or {}),
                         "extractor": "local",
@@ -232,12 +277,24 @@ class DocumentExtractor:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().extract_from_image(img_bytes, mime=mime)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
+               
+                
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(f"[uploaded image: {filename or 'image'}]")
+                    res = fallback_txt_lines_to_extraction(text)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
+                        "FALLBACK_LOCAL_USED",
                     ]
+                    res.meta = {
+                        **(res.meta or {}),
+                        "extractor": "local",
+                        "model": "local-fallback-v1",
+                        "openai_error_class": e.__class__.__name__,
+                        "openai_error_message": str(e),
+                        "fallback_used": True,
+                    }
+
                     res.meta = {
                         **(res.meta or {}),
                         "extractor": "local",
