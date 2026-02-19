@@ -6,7 +6,7 @@ import os
 import time, base64, json, threading
 import logging
 from ulid import ULID
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import JSONResponse
 import uuid
 from pathlib import Path
@@ -18,6 +18,14 @@ from dotenv import load_dotenv
 ##from app.api.routes_siigo_catalog import router as siigo_catalog_router
 from app.api.routes_quote_drafts import router as quote_drafts_router
 from app.services.document_extractor import DocumentExtractor
+from app.api.routes_catalog import router as catalog_router
+
+from pydantic import BaseModel, Field
+from typing import Optional
+from app.api.routes_matching import router as matching_router
+from app.db_engine import get_engine
+from app.api.routes_overrides import router as overrides_router
+
 
 
 
@@ -49,6 +57,10 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 app = FastAPI(title="SiigoCotizador", version="0.1.0")
 ##app.include_router(siigo_catalog_router)
 app.include_router(quote_drafts_router)
+app.include_router(catalog_router)
+app.include_router(matching_router)
+app.include_router(overrides_router)
+
 
 def new_correlation_id() -> str:
     return f"corr_{ULID()}"
@@ -550,6 +562,11 @@ async def commit_quote(draft_id: str, request: Request):
     engine = get_engine()
     log = logging.getLogger("uvicorn.error")
     correlation_id = request.headers.get("x-correlation-id") or request.headers.get("X-Correlation-Id") or ""
+    
+
+    def _strip_leading_qty_uom(s: str) -> str:
+        # quita "2 und", "8 m", "10 mts", etc al inicio
+        return re.sub(r"^\s*\d+(?:[.,]\d+)?\s*(und|un|unidad(?:es)?|m|mt|mts|metro(?:s)?)\b\s*", "", (s or "").strip(), flags=re.I)
 
     # -------------------------
     # 0) Leer body (JSON o FORM) y validar
@@ -628,15 +645,29 @@ async def commit_quote(draft_id: str, request: Request):
         if not draft:
             raise HTTPException(status_code=404, detail="Draft not found")
 
-        rows = conn.execute(
-            text("""
-                SELECT line_index, raw_text, description, quantity, uom
-                FROM draft_items
-                WHERE draft_id=:id
-                ORDER BY line_index
-            """),
-            {"id": draft_id},
-        ).mappings().all()
+
+
+        
+        
+        rows = conn.execute(text("""
+                SELECT
+                    di.line_index,
+                    di.raw_text,
+                    di.description,
+                    di.quantity,
+                    di.uom,
+                    di.item_code,
+                    di.item_name,
+                    sel.description_override,
+                    COALESCE(sel.sim, 0) AS match_sim
+                FROM draft_items di
+                LEFT JOIN draft_item_selections sel
+                    ON sel.draft_id = di.draft_id
+                AND sel.line_index = di.line_index
+                WHERE di.draft_id = :draft_id
+                ORDER BY di.line_index
+                LIMIT 500
+                """), {"draft_id": draft_id}).mappings().all()  
 
     if not rows:
         raise HTTPException(status_code=400, detail="Draft has no items. Parse first or PUT items.")
@@ -686,20 +717,66 @@ async def commit_quote(draft_id: str, request: Request):
             "note": "Already committed (idempotent). Not calling Siigo again.",
         }
 
+
+
+
+
+
+
     # -------------------------
-    # 4) Armar items (code fijo 2543)
+    # 4) Armar items (escalable)
+    # - Por defecto: code fijo 2543 (NO rompe nada)
+    # - Si ENABLE_MATCHING=1: usa draft_items.item_code si existe
+    # - AUTO_DESC: si hay override manual => gana
+    #            si no, y hay match fuerte => usa item_name como base
+    #            si no => usa description/raw_text
     # -------------------------
+    matching_enabled = str(os.getenv("ENABLE_MATCHING", "0")).lower() in ("1", "true", "yes", "on")
+
+    ENABLE_AUTO_DESC = str(os.getenv("ENABLE_AUTO_DESC", "0")).lower() in ("1", "true", "yes", "on")
+    AUTO_DESC_MIN_SIM = float(os.getenv("AUTO_DESC_MIN_SIM", "0.45"))
+
     items: List[Dict[str, Any]] = []
+
+
+    
     for r in rows:
+        code = (str(r.get("item_code") or "").strip()) or "2543"
+
+        qty = float(r.get("quantity") or 0)
+        uom = (r.get("uom") or "").strip()
+
+        # 1) override manual siempre gana
+        desc = (r.get("description_override") or "").strip()
+
+        if not desc:
+            sim = float(r.get("match_sim") or 0)
+
+            # 2) define base
+            if ENABLE_AUTO_DESC and sim >= AUTO_DESC_MIN_SIM and (r.get("item_name") or "").strip():
+                base = (r.get("item_name") or "").strip()
+            else:
+                base = (r.get("description") or "").strip() or (r.get("raw_text") or "").strip()
+
+            # ✅ AQUÍ va esto (antes del prefix)
+            base = _strip_leading_qty_uom(base)
+
+            prefix = f"{qty:g} {uom}".strip() if (qty and uom) else ""
+            desc = f"{prefix} {base}".strip() if prefix else base
+
         items.append(
             {
-                "code": "2543",
-                "description": r["description"],
-                "quantity": float(r["quantity"]),
+                "code": code,
+                "description": desc,
+                "quantity": qty,
                 "price": float(body.default_price),
             }
         )
+
     
+    
+    
+
     if document_id <= 0:
         raise HTTPException(status_code=409, detail={"code": "MISSING_DOCUMENT_ID"})
 
@@ -712,7 +789,7 @@ async def commit_quote(draft_id: str, request: Request):
     }
 
     # -------------------------
-    # 5) Dry-run
+    # 5) Dry-run (DEVUELVE DESPUÉS DE ARMAR TODO)
     # -------------------------
     if body.dry_run:
         return {
@@ -729,37 +806,12 @@ async def commit_quote(draft_id: str, request: Request):
             },
         }
 
-    # -------------------------
-    # 6) Llamada real a Siigo (+ autocreate si aplica)
-    # -------------------------
-    gw = get_gateway()
-    customer_created: Optional[Dict[str, Any]] = None
 
-    # helper functions (los mismos tuyos)
-    def _is_customer_missing_siigo(http_exc: HTTPException) -> bool:
-        detail = http_exc.detail
-        if isinstance(detail, str):
-            try:
-                detail = json.loads(detail)
-            except Exception:
-                return False
 
-        if isinstance(detail, dict) and "detail" in detail and isinstance(detail["detail"], dict):
-            detail = detail["detail"]
-
-        if not isinstance(detail, dict):
-            return False
-
-        if (detail.get("siigoapi_error_code") or "").lower() != "invalid_reference":
-            return False
-
-        resp = detail.get("response") or {}
-        errors = resp.get("Errors") or []
-        for e in errors:
-            msg = (e.get("Message") or "").lower()
-            if "customer doesn't exist" in msg:
-                return True
-        return False
+        # -------------------------
+        # 6) Llamada real a Siigo (+ autocreate si aplica)
+        # -------------------------
+    
 
     def _validate_customer_payload(payload: Dict[str, Any]) -> List[str]:
         missing: List[str] = []
@@ -792,6 +844,38 @@ async def commit_quote(draft_id: str, request: Request):
 
         return missing
 
+    def _normalize_detail(http_exc: HTTPException) -> Dict[str, Any]:
+        detail = http_exc.detail
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except Exception:
+                return {}
+        if isinstance(detail, dict) and "detail" in detail and isinstance(detail["detail"], dict):
+            detail = detail["detail"]
+        return detail if isinstance(detail, dict) else {}
+
+    def _siigo_code(http_exc: HTTPException) -> str:
+        return (_normalize_detail(http_exc).get("siigoapi_error_code") or "").lower()
+
+    def _is_customer_missing_siigo(http_exc: HTTPException) -> bool:
+        # Siigo: invalid_reference y en el mensaje dice que el customer no existe
+        if _siigo_code(http_exc) != "invalid_reference":
+            return False
+        resp = _normalize_detail(http_exc).get("response") or {}
+        errors = resp.get("Errors") or []
+        for e in errors:
+            msg = (e.get("Message") or "").lower()
+            if "customer doesn't exist" in msg or "customer doesnt exist" in msg:
+                return True
+        return False
+
+    def _is_duplicated_document_siigo(http_exc: HTTPException) -> bool:
+        return _siigo_code(http_exc) == "duplicated_document"
+
+    gw = get_gateway()
+    customer_created: Optional[Dict[str, Any]] = None
+
     try:
         quote_resp = gw.create_quote(
             customer_identification=str(customer_identification),
@@ -802,23 +886,41 @@ async def commit_quote(draft_id: str, request: Request):
             date_iso=str(date.today()),
         )
 
+ 
     except HTTPException as e:
+        if _is_duplicated_document_siigo(e):
+            raise HTTPException(status_code=409, detail={"code": "SIIGO_DUPLICATED_DOCUMENT", **_normalize_detail(e)})
+
         if not _is_customer_missing_siigo(e):
             raise
 
+
+        # 3) Cliente no existe -> si no autorizaste autocreate, error controlado
         if not body.create_customer_if_missing:
             raise HTTPException(status_code=409, detail={"code": "CLIENT_NOT_FOUND"})
 
         if not body.customer_create_payload:
-            raise HTTPException(status_code=409, detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]})
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]},
+            )
 
         missing_fields = _validate_customer_payload(body.customer_create_payload)
         if missing_fields:
-            raise HTTPException(status_code=409, detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields})
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields},
+            )
 
-        log.info("customer_auto_create_attempt", extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)})
+        log.info(
+            "customer_auto_create_attempt",
+            extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
+        )
         customer_created = gw.create_client(body.customer_create_payload)
-        log.info("customer_auto_create_success", extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)})
+        log.info(
+            "customer_auto_create_success",
+            extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
+        )
 
         time.sleep(1)
 
@@ -831,6 +933,9 @@ async def commit_quote(draft_id: str, request: Request):
             date_iso=str(date.today()),
         )
 
+    # -------------------------
+    # 7) Guardar resultado y marcar COMMITTED
+    # -------------------------
     up_client_id = ""
     if isinstance(customer_created, dict):
         up_client_id = str(customer_created.get("id") or "")
@@ -860,3 +965,65 @@ async def commit_quote(draft_id: str, request: Request):
         "upstream_client_id": up_client_id,
         "siigo_quote_response": quote_resp,
     }
+
+
+# =========================
+# Catalog shadow search (Feature-flagged)
+# =========================
+
+
+class CatalogSearchIn(BaseModel):
+    org_id: str
+    provider: str = "siigo"
+    q: str = Field(..., min_length=1)
+    limit: int = Field(5, ge=1, le=20)
+
+@app.post("/v1/catalog/search")
+def catalog_search(payload: CatalogSearchIn):
+    # ✅ Feature flag: si está apagado, el endpoint “no existe”
+    if os.getenv("ENABLE_CATALOG_SEARCH", "0") != "1":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    q = (payload.q or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q is required")
+
+    eng = get_engine()  # ya lo tienes definido en este mismo main.py
+
+    sql = text("""
+        WITH q AS (
+          SELECT
+            unaccent(lower(:q)) AS q_norm,
+            plainto_tsquery('simple', unaccent(lower(:q))) AS tsq
+        )
+        SELECT
+          cp.code,
+          cp.name,
+          cp.description,
+          cp.brand,
+          cp.model,
+          cp.price1,
+          cp.unit,
+          (
+            0.75 * COALESCE(similarity(cp.search_text, q.q_norm), 0) +
+            0.25 * COALESCE(ts_rank(cp.search_tsv, q.tsq), 0)
+          ) AS score
+        FROM catalog_products cp, q
+        WHERE cp.org_id = :org_id
+          AND cp.provider = :provider
+        ORDER BY score DESC
+        LIMIT :limit;
+    """)
+
+    with eng.connect() as conn:
+        rows = conn.execute(
+            sql,
+            {
+                "q": q,
+                "org_id": payload.org_id,
+                "provider": payload.provider,
+                "limit": int(payload.limit),
+            },
+        ).mappings().all()
+
+    return {"items": [dict(r) for r in rows]}
