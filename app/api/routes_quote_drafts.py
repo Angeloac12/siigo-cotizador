@@ -3,10 +3,11 @@ import httpx
 from typing import Any, Dict, Optional
 import json as _json
 import logging
+import os
+
 from app.services.local_fallback_parser import fallback_enabled, fallback_txt_lines_to_extraction
 
 logger = logging.getLogger("uvicorn.error")
-
 
 router = APIRouter(prefix="/v1/quote-drafts", tags=["quote-drafts"])
 ERROR_MESSAGES = {
@@ -19,12 +20,16 @@ def _timeout_for_path(path: str) -> httpx.Timeout:
     # Ajusta según tu realidad:
     # - upload: rápido
     # - parse: puede tardar ~90s+ cuando OpenAI se pone lento
+    # - match: puede tardar según catálogo/búsqueda
     # - commit: medio
     if path.endswith("/parse"):
         return httpx.Timeout(180.0, connect=10.0, read=180.0, write=30.0, pool=10.0)
     if path.endswith("/upload"):
         return httpx.Timeout(60.0, connect=10.0, read=60.0, write=30.0, pool=10.0)
+    if path.endswith("/match"):
+        return httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
     return httpx.Timeout(90.0, connect=10.0, read=90.0, write=30.0, pool=10.0)
+
 
 def _base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
@@ -45,8 +50,6 @@ async def _proxy(
     if corr:
         headers["X-Correlation-Id"] = corr
 
-    
-        
     timeout = _timeout_for_path(path)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -59,7 +62,6 @@ async def _proxy(
                 json=json,
             )
         except httpx.TimeoutException:
-            # Evita 500; deja un error claro para UI/Edge
             raise HTTPException(
                 status_code=504,
                 detail={
@@ -81,7 +83,6 @@ async def _proxy(
                 },
             )
 
-
     if resp.status_code >= 400:
         try:
             data = resp.json()
@@ -100,10 +101,7 @@ async def _proxy(
 
         raise HTTPException(status_code=resp.status_code, detail=data)
 
-    return resp.json(
-        
-    )
-
+    return resp.json()
 
 
 @router.get("/health")
@@ -164,7 +162,6 @@ async def submit_quote_draft(
     return await _proxy(request, "POST", f"/v1/drafts/{draft_id}/quote/commit", x_api_key, json=payload)
 
 
-
 @router.post("/process")
 async def process_quote_draft(
     request: Request,
@@ -178,6 +175,7 @@ async def process_quote_draft(
     create_customer_if_missing: bool = Form(False),
     customer_create_payload: Optional[str] = Form(None),
     x_api_key: str = Header(..., alias="X-API-Key"),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-Id"),  # ✅ NUEVO
 ):
     # ✅ Lee el archivo UNA sola vez (y valida que no esté vacío)
     file_bytes = await file.read()
@@ -190,7 +188,6 @@ async def process_quote_draft(
     except Exception:
         raw_text = ""
 
-    
     if file_len == 0:
         raise HTTPException(
             status_code=400,
@@ -213,8 +210,6 @@ async def process_quote_draft(
 
     # 2) parse
     parse_json = await _proxy(request, "POST", f"/v1/drafts/{draft_id}/parse", x_api_key)
-
-    
     items_created = int(parse_json.get("items_created") or 0)
 
     if items_created <= 0:
@@ -255,7 +250,6 @@ async def process_quote_draft(
                     "meta": {"source_type": "txt", "extractor": "local", "model": "local-fallback-v1"},
                     "items": items_payload["items"],
                 }
-
             else:
                 logger.warning("NO_ITEMS_EXTRACTED draft_id=%s filename=%s bytes=%s", draft_id, file.filename, file_len)
                 raise HTTPException(
@@ -278,6 +272,33 @@ async def process_quote_draft(
                     "parse": parse_json,
                 },
             )
+
+    # ✅ 2.5) MATCH (apply=true) ANTES del commit (solo si ENABLE_MATCHING=1)
+    match_json = None
+    try:
+        matching_enabled = str(os.getenv("ENABLE_MATCHING", "0")).lower() in ("1", "true", "yes", "on")
+        if matching_enabled:
+            if not x_org_id:
+                # No rompemos: solo warning
+                if isinstance(parse_json, dict):
+                    parse_json.setdefault("warnings", [])
+                    if "MISSING_X_ORG_ID_FOR_MATCH" not in parse_json["warnings"]:
+                        parse_json["warnings"].append("MISSING_X_ORG_ID_FOR_MATCH")
+                logger.warning("MATCHING_ENABLED_BUT_NO_X_ORG_ID draft_id=%s", draft_id)
+            else:
+                match_json = await _proxy(
+                    request,
+                    "POST",
+                    f"/v1/drafts/{draft_id}/match",
+                    x_api_key,
+                    json={"org_id": x_org_id, "provider": "siigo", "limit": 5, "apply": True},
+                )
+    except Exception as e:
+        logger.exception("MATCH_STEP_FAILED draft_id=%s err=%s", draft_id, str(e))
+        if isinstance(parse_json, dict):
+            parse_json.setdefault("warnings", [])
+            if "MATCH_STEP_FAILED" not in parse_json["warnings"]:
+                parse_json["warnings"].append("MATCH_STEP_FAILED")
 
     # 3) build submit payload
     submit_payload: Dict[str, Any] = {
@@ -309,5 +330,6 @@ async def process_quote_draft(
         "draft_id": draft_id,
         "upload": upload_json,
         "parse": parse_json,
+        "match": match_json,  # ✅ NUEVO
         "submit": submit_json,
     }
