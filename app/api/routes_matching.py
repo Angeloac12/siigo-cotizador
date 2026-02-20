@@ -2,9 +2,11 @@ import os
 import re
 import json
 import unicodedata
-from fastapi import APIRouter, HTTPException, Body
+from fastapi import APIRouter, HTTPException, Body, Header
 from sqlalchemy import text
 from app.db_engine import get_engine
+from pydantic import BaseModel, Field
+from typing import Optional
 
 router = APIRouter(prefix="/v1", tags=["matching"])
 
@@ -430,4 +432,134 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
         "provider": provider,
         "apply": apply,
         "items": results_out,
+    }
+
+
+
+
+class SelectItemBody(BaseModel):
+    org_id: Optional[str] = None
+    provider: str = "siigo"
+    code: str = Field(..., min_length=1)
+    name: Optional[str] = None
+    sim: Optional[float] = None
+    rank: Optional[float] = None
+
+@router.patch("/drafts/{draft_id}/items/{line_index}/select")
+def select_item_for_draft_line(
+    draft_id: str,
+    line_index: int,
+    payload: SelectItemBody,
+    x_org_id: Optional[str] = Header(default=None, alias="X-Org-Id"),
+):
+    if not _enabled():
+        raise HTTPException(status_code=404, detail={"code": "MATCHING_DISABLED"})
+
+    org_id = (x_org_id or payload.org_id or "").strip()
+    provider = (payload.provider or "siigo").strip()
+    code = (payload.code or "").strip()
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail={"code": "MISSING_ORG_ID"})
+    if not code:
+        raise HTTPException(status_code=400, detail={"code": "MISSING_CODE"})
+
+    eng = get_engine()
+
+    with eng.begin() as conn:
+        # 1) validar item existe
+        row = conn.execute(
+            text("""
+                SELECT line_index
+                FROM draft_items
+                WHERE draft_id=:draft_id AND line_index=:line_index
+                LIMIT 1
+            """),
+            {"draft_id": draft_id, "line_index": int(line_index)},
+        ).mappings().first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail={"code": "ITEM_NOT_FOUND"})
+
+        # 2) validar que el code exista en el catálogo del org (seguridad multi-tenant)
+        prod = conn.execute(
+            text("""
+                SELECT code, name
+                FROM catalog_products
+                WHERE org_id=:org_id AND provider=:provider AND code=:code
+                LIMIT 1
+            """),
+            {"org_id": org_id, "provider": provider, "code": code},
+        ).mappings().first()
+
+        if not prod:
+            raise HTTPException(status_code=404, detail={"code": "CATALOG_CODE_NOT_FOUND", "code_value": code})
+
+        name_final = (payload.name or prod.get("name") or "").strip() or str(code)
+
+        sim = float(payload.sim or 0)
+        rank = float(payload.rank or 0)
+
+        # 3) actualizar draft_items (commit usa esto)
+        conn.execute(
+            text("""
+                UPDATE draft_items
+                SET item_code=:code,
+                    item_name=:name,
+                    match_sim=:sim,
+                    match_rank=:rank,
+                    updated_at=now()
+                WHERE draft_id=:draft_id AND line_index=:line_index
+            """),
+            {
+                "draft_id": draft_id,
+                "line_index": int(line_index),
+                "code": str(code),
+                "name": name_final,
+                "sim": sim,
+                "rank": rank,
+            },
+        )
+
+        # 4) upsert selección (para auditoría/UI)
+        conn.execute(
+            text("""
+                INSERT INTO draft_item_selections(
+                    draft_id, line_index, provider,
+                    selected_code, selected_name,
+                    sim, rank,
+                    chosen_by, updated_at
+                )
+                VALUES(
+                    :draft_id, :line_index, :provider,
+                    :code, :name,
+                    :sim, :rank,
+                    'user', now()
+                )
+                ON CONFLICT (draft_id, line_index) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    selected_code = EXCLUDED.selected_code,
+                    selected_name = EXCLUDED.selected_name,
+                    sim = EXCLUDED.sim,
+                    rank = EXCLUDED.rank,
+                    chosen_by = 'user',
+                    updated_at = now()
+            """),
+            {
+                "draft_id": draft_id,
+                "line_index": int(line_index),
+                "provider": provider,
+                "code": str(code),
+                "name": name_final,
+                "sim": sim,
+                "rank": rank,
+            },
+        )
+
+    return {
+        "draft_id": draft_id,
+        "line_index": int(line_index),
+        "provider": provider,
+        "selected": {"code": str(code), "name": name_final, "sim": sim, "rank": rank},
+        "saved": True,
     }
