@@ -1,41 +1,55 @@
-# app/services/local_fallback_parser.py
 from __future__ import annotations
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from app.schemas.extraction import ExtractionResult, ExtractedItem, Uom
+
 
 def fallback_enabled() -> bool:
     return os.getenv("ENABLE_FALLBACK_REGEX", "true").lower() in ("1", "true", "yes", "y")
 
+
 _UOM_ALIASES = {
-    
     # UND
-    "und": Uom.UND, "unid": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND, "pza": Uom.UND, "pzas": Uom.UND, "unidades": Uom.UND, "uds": Uom.UND, "unds": Uom.UND, "unid": Uom.UND, "unid.": Uom.UND, "unids": Uom.UND,
+    "und": Uom.UND, "unid": Uom.UND, "unidad": Uom.UND, "un": Uom.UND, "u": Uom.UND,
+    "pza": Uom.UND, "pzas": Uom.UND, "unidades": Uom.UND, "uds": Uom.UND, "unds": Uom.UND,
+    "unid.": Uom.UND, "unids": Uom.UND,
 
     # M
     "m": Uom.M, "mt": Uom.M, "mts": Uom.M, "mtr": Uom.M, "mtrs": Uom.M, "metro": Uom.M, "metros": Uom.M,
+
     # KG
     "kg": Uom.KG, "kilo": Uom.KG, "kilos": Uom.KG, "kilogramo": Uom.KG, "kilogramos": Uom.KG,
+
     # ROL
     "rol": Uom.ROL, "rollo": Uom.ROL, "rollos": Uom.ROL,
+
     # EA
     "ea": Uom.EA,
+
     # BOX
     "box": Uom.BOX, "caja": Uom.BOX, "cajas": Uom.BOX,
+
     # SET
     "set": Uom.SET, "juego": Uom.SET, "juegos": Uom.SET, "kit": Uom.SET,
+
     # L
     "l": Uom.L, "lt": Uom.L, "lts": Uom.L, "litro": Uom.L, "litros": Uom.L,
+
     # GAL
     "gal": Uom.GAL, "galon": Uom.GAL, "galones": Uom.GAL,
+
     # PACK
     "pack": Uom.PACK, "paquete": Uom.PACK, "paquetes": Uom.PACK, "pkg": Uom.PACK,
 }
 
 _BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]+\s*")
 
+# tokens que NO son UOM (son specs típicos)
+_AMP_TOKENS_RE = re.compile(r"\b(\d{1,4})\s*(amp|amps|amperios?|a)\b", flags=re.IGNORECASE)
+_WATT_TOKENS_RE = re.compile(r"\b(\d{1,5})\s*w\b", flags=re.IGNORECASE)
+_VOLT_TOKENS_RE = re.compile(r"\b(\d{1,5})\s*v\b", flags=re.IGNORECASE)
 
 
 def _to_float(s: str) -> Optional[float]:
@@ -43,13 +57,10 @@ def _to_float(s: str) -> Optional[float]:
     if not s:
         return None
 
-    # 1.234,56 -> 1234.56
     if "." in s and "," in s:
         s = s.replace(".", "").replace(",", ".")
-    # 1,5 -> 1.5
     elif "," in s:
         s = s.replace(",", ".")
-    # 1200 o 12.5 quedan igual
 
     try:
         return float(s)
@@ -61,19 +72,27 @@ def _infer_uom(token: Optional[str]) -> Optional[Uom]:
     if not token:
         return None
     t = token.strip().lower()
-    # limpiar puntuación
     t = re.sub(r"[^a-zA-Z0-9]+", "", t)
     return _UOM_ALIASES.get(t)
+
+
+def _normalize_specs_text(s: str) -> str:
+    """
+    Evita que '20 amp', '20A', '18W', '110V' se interpreten como 'qty+uom' al final.
+    Los normalizamos a tokens pegados (20A/18W/110V) para que queden como parte de la descripción.
+    """
+    s = _AMP_TOKENS_RE.sub(lambda m: f"{m.group(1)}A", s)
+    s = _WATT_TOKENS_RE.sub(lambda m: f"{m.group(1)}W", s)
+    s = _VOLT_TOKENS_RE.sub(lambda m: f"{m.group(1)}V", s)
+    return s
 
 
 def _extract_qty_uom_desc(raw: str):
     warnings: List[str] = []
     raw_clean = _BULLET_PREFIX_RE.sub("", (raw or "").strip())
+    raw_clean = _normalize_specs_text(raw_clean)
 
-    # --------------------------
-    # 0) Formato fuerte del frontend:
-    # QTY=2 | DESC=Rollo cable No. 12 x 100 m - Rojo
-    # --------------------------
+    # 0) Formato fuerte frontend
     m = re.match(
         r"^\s*QTY\s*=\s*(\d+(?:[.,]\d+)?)\s*\|\s*DESC\s*=\s*(.+?)\s*$",
         raw_clean,
@@ -85,68 +104,53 @@ def _extract_qty_uom_desc(raw: str):
         if qty <= 0:
             qty = 1.0
             warnings.append("QTY_INFERRED")
-        # uom por defecto
         return float(qty), Uom.UND, desc, warnings, 0.85, None
 
     qty: Optional[float] = None
     uom: Optional[Uom] = None
     uom_raw: Optional[str] = None
     desc = raw_clean
-    
-    # --------------------------
-    # 1) Cantidad al final con unidad (con o sin guion) + paréntesis opcional:
-    # "Cinta ... 2 unid"
-    # "Borna ... - 2 und"
-    # "Hebillas ... 1 unid (paquete)"
-    # "Cable ... 30 unid (metros)"
-    # --------------------------
+
+    # 1) Cantidad al final + unidad + (paren opcional)
+    # OJO: solo aceptamos este patrón si la unidad es reconocida (o el paréntesis lo es).
     m = re.match(
-        r"^(.*?)(?:\s*[-–—]\s*|\s+)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
+        r"^(.*?)(?:\s*[-–—]\s*|\s+)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)(?:\s*\(\s*([^)]+?)\s*\))?\s*$",
         raw_clean,
     )
-
     if m:
         left = (m.group(1) or "").strip()
         qty2 = _to_float(m.group(2))
         unit_raw = (m.group(3) or "").strip()
-        paren_raw = (m.group(4) or "").strip() if (getattr(m, "lastindex", 0) or 0) >= 4 else ""
+        paren_raw = (m.group(4) or "").strip() if (m.group(4) or "").strip() else ""
 
         maybe_uom = _infer_uom(unit_raw)
         paren_uom = _infer_uom(paren_raw) if paren_raw else None
 
-        if qty2 is not None and qty2 > 0:
+        # ✅ Si no reconocemos unidad NI paréntesis, NO lo tratamos como qty/uom tail
+        # (esto evita 20A, 18W, 110V, etc.)
+        if qty2 is not None and qty2 > 0 and (maybe_uom is not None or paren_uom is not None):
             qty = qty2
             desc = left
             uom_raw = unit_raw
 
-            # 1) unidad directa
             if maybe_uom is not None:
                 uom = maybe_uom
-
-                # si la unidad es genérica (UND) y el paréntesis sugiere otra unidad (metros, etc) => preferimos paréntesis
                 if uom == Uom.UND and paren_uom is not None and paren_uom != uom:
                     uom = paren_uom
                     warnings.append("UOM_FROM_PAREN")
                     uom_raw = f"{unit_raw}({paren_raw})"
-
-            # 2) unidad no reconocida, pero paréntesis sí
             elif paren_uom is not None:
                 uom = paren_uom
                 warnings.append("UOM_FROM_PAREN")
                 uom_raw = f"{unit_raw}({paren_raw})"
-
-            # 3) nada reconocido => UND sin romper
             else:
                 uom = Uom.UND
                 warnings.append("UOM_INFERRED")
 
-            # si hay paréntesis y no lo usamos como unidad, lo dejamos en desc como calificador
             if paren_raw and "UOM_FROM_PAREN" not in warnings:
                 desc = f"{desc} ({paren_raw})".strip()
-    # --------------------------
-    # 1b) Cantidad al final con unidad (SIN guion):
-    # "Cinta autofundente #23 2 unid"
-    # --------------------------
+
+    # 1b) Cantidad al final SIN guion (solo si unidad reconocida)
     if qty is None:
         m = re.match(
             r"^(.*?)(?:\s+)(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$",
@@ -164,10 +168,7 @@ def _extract_qty_uom_desc(raw: str):
                 uom_raw = unit_raw
                 desc = left
 
-    # --------------------------
-    # 2) Cantidad al final con "x":
-    # "Lampara 18W x 34"
-    # --------------------------
+    # 2) Cantidad al final con "x"
     if qty is None:
         m = re.match(r"^(.*?)(?:\s*[xX]\s*)(\d+(?:[.,]\d+)?)\s*$", raw_clean)
         if m:
@@ -178,13 +179,7 @@ def _extract_qty_uom_desc(raw: str):
                 uom = Uom.UND
                 desc = left
 
-    # --------------------------
-    # 3) Cantidad al inicio:
-    # "10 cable THHN..."
-    # "10 mts cable #8"
-    # "2 rollos cable #12"
-    # "6und x 60cm - MANGUERA ..."
-    # --------------------------
+    # 3) Cantidad al inicio
     if qty is None:
         m = re.match(r"^(\d+(?:[.,]\d+)?)\s*(?:x\s*)?([A-Za-zñÑ\.]+)?\s*(.+)$", raw_clean)
         if m:
@@ -194,7 +189,6 @@ def _extract_qty_uom_desc(raw: str):
 
             if qty3 is not None and qty3 > 0:
                 qty = qty3
-
                 token = token_raw.lower().strip(".")
                 maybe_uom = _infer_uom(token)
 
@@ -203,12 +197,9 @@ def _extract_qty_uom_desc(raw: str):
                     uom_raw = token_raw
                     desc = rest
                 else:
-                    # token NO es unidad -> hace parte de la descripción
                     desc = f"{token_raw} {rest}".strip() if token_raw else rest
 
-    # --------------------------
-    # Defaults + limpieza
-    # --------------------------
+    # Defaults
     if qty is None or qty <= 0:
         qty = 1.0
         warnings.append("QTY_INFERRED")
@@ -222,7 +213,6 @@ def _extract_qty_uom_desc(raw: str):
         desc2 = raw_clean
         warnings.append("DESCRIPTION_FALLBACK")
 
-    # Confidence
     conf = 0.4
     if "QTY_INFERRED" not in warnings and "UOM_INFERRED" not in warnings:
         conf = 0.78
@@ -232,17 +222,12 @@ def _extract_qty_uom_desc(raw: str):
     return float(qty), uom, desc2, warnings, conf, uom_raw
 
 
-
-
-
-
-
 def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> ExtractionResult:
     items: List[ExtractedItem] = []
     global_warnings: List[str] = []
 
     lines = [ln.strip() for ln in (text or "").splitlines()]
-    lines = [ln for ln in lines if ln]  # drop empties
+    lines = [ln for ln in lines if ln]
 
     for idx, ln in enumerate(lines):
         if len(items) >= max_items:
@@ -251,7 +236,6 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
 
         qty, uom, desc, warnings, conf, uom_raw = _extract_qty_uom_desc(ln)
 
-        # Si qty y uom fueron inferidos (no venían en el texto), es una línea dudosa.
         if "QTY_INFERRED" in warnings and "UOM_INFERRED" in warnings and conf < 0.5:
             continue
 
@@ -275,14 +259,7 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
     )
 
 
-
-
 def fallback_table_text_to_extraction(table_text: str, source_type: str, max_items: int = 200) -> ExtractionResult:
-    """
-    table_text es TSV:
-    header1\theader2...
-    v1\tv2...
-    """
     lines = [ln.rstrip("\n") for ln in (table_text or "").splitlines() if ln.strip()]
     if not lines:
         return ExtractionResult(items=[], global_warnings=["EMPTY_TABLE"], meta={"source_type": source_type, "extractor": "local"})
@@ -310,7 +287,6 @@ def fallback_table_text_to_extraction(table_text: str, source_type: str, max_ite
             break
 
         cols = [c.strip() for c in row.split("\t")]
-        # asegurar largo
         while len(cols) < len(header):
             cols.append("")
 
@@ -331,10 +307,8 @@ def fallback_table_text_to_extraction(table_text: str, source_type: str, max_ite
         if desc_idx is not None:
             desc = cols[desc_idx]
         else:
-            # fallback: join columnas no vacías
             desc = " ".join([c for c in cols if c])
 
-        # si qty/uom no claros, intentar inferir desde desc
         if qty is None or qty <= 0 or uom is None:
             qty2, uom2, desc2, infer_warnings, conf, uom_raw2 = _extract_qty_uom_desc(desc or raw_text)
             if qty is None or qty <= 0:
