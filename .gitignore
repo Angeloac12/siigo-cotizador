@@ -20,3 +20,16 @@ load_results*.txt
 times_*.txt
 cotizacion_test.txt
 edge_*.sh
+
+# Ad-hoc test payloads & scripts at project root
+/edge_*.json
+/smoke*.json
+/fast_*.json
+/timeout_*.json
+/out_test.json
+/users.json
+/cotizacion_big.txt
+/cotizacion_parser_test.txt
+/edge_headers.txt
+/rfq_hard.txt
+/*.sh
