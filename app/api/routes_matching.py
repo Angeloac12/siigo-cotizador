@@ -114,21 +114,40 @@ def _has_any(text: str, words: list[str]) -> bool:
 # Spec extraction
 # =========================
 _RE_AWG_NUM = re.compile(r"(?:#\s*(\d{1,2})\b|\bno\.?\s*(\d{1,2})\b|\bn\s*(\d{1,2})\b|\b(\d{1,2})\s*awg\b|\bawg\s*(\d{1,2})\b)", re.I)
-_RE_AWG_OUGHT = re.compile(r"\b([1-4])\s*[/\-]\s*0\b", re.I)
+# Catalog pattern: "THHN THWN 14 7HILOS" or "THHN THWN 12 19HILOS" — bare number after THHN/THWN
+_RE_AWG_AFTER_THHN = re.compile(r"thhn\s*(?:thwn)?\s+(\d{1,3})\b", re.I)
+# x/0 patterns: 1/0, 2/0, 3/0, 4/0 — with or without trailing "awg"
+_RE_AWG_OUGHT = re.compile(r"(?:^|\b)([1-4])\s*[/\-]\s*0(?:\s*awg)?\b", re.I)
+# NxAWG multi-conductor: 3x12, 2x14, 4x12 — extract the AWG part (second number)
+_RE_MULTI_AWG = re.compile(r"\b\d[xX](\d{1,2})\s*(?:awg)?\b", re.I)
 _RE_KCMIL = re.compile(r"\b(\d{3,4})\s*k(?:cmil)?\b", re.I)
 _RE_AMP = re.compile(r"\b(\d{1,4})\s*a\b|\b(\d{1,4})\s*amp(?:s)?\b", re.I)
 
 def _extract_awg_any(text_in: str) -> str | None:
     t = _fold(text_in)
+    # 1) x/0 patterns first (1/0, 2/0, 3/0, 4/0)
     m0 = _RE_AWG_OUGHT.search(t)
     if m0:
         return f"{m0.group(1)}/0"
+    # 2) Standard AWG number (#12, No.14, 12AWG, AWG 12)
     m = _RE_AWG_NUM.search(t)
     if m:
         g = next((x for x in m.groups() if x), None)
         if g:
             return str(int(g))
-    # kcmil sizes (250, 350, 500, etc.)
+    # 2b) Catalog pattern: "THHN THWN 14 ..." — bare number after THHN/THWN
+    mt = _RE_AWG_AFTER_THHN.search(t)
+    if mt:
+        val = int(mt.group(1))
+        # 250, 350, 500, 600, 750 etc. are kcmil sizes, not AWG
+        if val >= 250:
+            return f"{val}kcmil"
+        return str(val)
+    # 3) Multi-conductor NxAWG (3x12, 2x14, 4x12)
+    mm = _RE_MULTI_AWG.search(t)
+    if mm:
+        return str(int(mm.group(1)))
+    # 4) kcmil sizes (250, 350, 500, etc.)
     mk = _RE_KCMIL.search(t)
     if mk:
         return f"{mk.group(1)}kcmil"
@@ -143,6 +162,9 @@ def _extract_amp_any(text_in: str) -> str | None:
             return str(int(g))
     return None
 
+# Patterns that indicate cable context even without explicit "cable" keyword
+_RE_CABLE_PREFIX = re.compile(r"(?:^|\b)(?:a|c)\.?\s*\d", re.I)  # "A.14", "C.12", "A.10" etc.
+
 def _detect_category(q: str, cfg: dict) -> str | None:
     ql = _fold(q)
     cats = (cfg.get("categories") or {})
@@ -151,6 +173,9 @@ def _detect_category(q: str, cfg: dict) -> str | None:
             wl = _fold(w)
             if wl and wl in ql:
                 return cat
+    # Fallback: if query starts with "A." or "C." followed by a number, it's cable
+    if _RE_CABLE_PREFIX.search(ql):
+        return "cable"
     return None
 
 def _extract_specs(q: str, cfg: dict) -> dict:
