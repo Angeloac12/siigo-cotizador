@@ -18,6 +18,7 @@ _UOM_ALIASES = {
 
     # M
     "m": Uom.M, "mt": Uom.M, "mts": Uom.M, "mtr": Uom.M, "mtrs": Uom.M, "metro": Uom.M, "metros": Uom.M,
+    "ml": Uom.M,  # metros lineales
 
     # KG
     "kg": Uom.KG, "kilo": Uom.KG, "kilos": Uom.KG, "kilogramo": Uom.KG, "kilogramos": Uom.KG,
@@ -50,6 +51,14 @@ _BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]+\s*")
 _AMP_TOKENS_RE = re.compile(r"\b(\d{1,4})\s*(amp|amps|amperios?|a)\b", flags=re.IGNORECASE)
 _WATT_TOKENS_RE = re.compile(r"\b(\d{1,5})\s*w\b", flags=re.IGNORECASE)
 _VOLT_TOKENS_RE = re.compile(r"\b(\d{1,5})\s*v\b", flags=re.IGNORECASE)
+
+# Multi-conductor prefix: 3x12, 2x14AWG, 4x12 AWG etc.
+_MULTI_CONDUCTOR_RE = re.compile(r"^\s*(\d)[xX](\d{1,2})\s*(?:AWG)?\b", flags=re.IGNORECASE)
+
+# Trailing qty+UOM at end of line (e.g. "... 6500 ML", "... 300 M", "... 150 MTS")
+_TRAILING_QTY_UOM_RE = re.compile(
+    r"^(.*?)\s+(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$"
+)
 
 
 def _to_float(s: str) -> Optional[float]:
@@ -91,6 +100,24 @@ def _extract_qty_uom_desc(raw: str):
     warnings: List[str] = []
     raw_clean = _BULLET_PREFIX_RE.sub("", (raw or "").strip())
     raw_clean = _normalize_specs_text(raw_clean)
+
+    # 0a) Multi-conductor NxAWG: qty comes from trailing number+UOM, not from prefix
+    mc = _MULTI_CONDUCTOR_RE.match(raw_clean)
+    if mc:
+        # The whole line is multi-conductor (e.g. "3x12AWG CuTHHN TPX 600V 90C 6500 ML")
+        # Try to extract trailing qty+UOM
+        tail_m = _TRAILING_QTY_UOM_RE.match(raw_clean)
+        if tail_m:
+            left = (tail_m.group(1) or "").strip()
+            tail_qty = _to_float(tail_m.group(2))
+            tail_unit = (tail_m.group(3) or "").strip()
+            tail_uom = _infer_uom(tail_unit)
+
+            if tail_qty is not None and tail_qty > 0 and tail_uom is not None:
+                # Clean description = line without trailing qty+UOM
+                desc_clean = _normalize_specs_text(left)
+                conf = 0.78
+                return float(tail_qty), tail_uom, desc_clean, warnings, conf, tail_unit
 
     # 0) Formato fuerte frontend
     m = re.match(

@@ -2,6 +2,7 @@ import os
 import re
 import json
 import unicodedata
+from collections import defaultdict
 from fastapi import APIRouter, HTTPException, Body, Header
 from sqlalchemy import text
 from app.db_engine import get_engine
@@ -19,7 +20,7 @@ def _enabled() -> bool:
 # =========================
 _DEFAULT_MATCH_CONFIG = {
     "categories": {
-        "cable": ["cable", "alambre", "conductor"],
+        "cable": ["cable", "alambre", "conductor", "thhn", "thwn", "thw", "tpx", "acsr", "awg", "kcmil", "xlpe", "hffr"],
         "breaker": ["breaker", "interruptor", "termomagnetico", "termomagnético"],
     },
     "keywords": {
@@ -114,6 +115,7 @@ def _has_any(text: str, words: list[str]) -> bool:
 # =========================
 _RE_AWG_NUM = re.compile(r"(?:#\s*(\d{1,2})\b|\bno\.?\s*(\d{1,2})\b|\bn\s*(\d{1,2})\b|\b(\d{1,2})\s*awg\b|\bawg\s*(\d{1,2})\b)", re.I)
 _RE_AWG_OUGHT = re.compile(r"\b([1-4])\s*[/\-]\s*0\b", re.I)
+_RE_KCMIL = re.compile(r"\b(\d{3,4})\s*k(?:cmil)?\b", re.I)
 _RE_AMP = re.compile(r"\b(\d{1,4})\s*a\b|\b(\d{1,4})\s*amp(?:s)?\b", re.I)
 
 def _extract_awg_any(text_in: str) -> str | None:
@@ -126,6 +128,10 @@ def _extract_awg_any(text_in: str) -> str | None:
         g = next((x for x in m.groups() if x), None)
         if g:
             return str(int(g))
+    # kcmil sizes (250, 350, 500, etc.)
+    mk = _RE_KCMIL.search(t)
+    if mk:
+        return f"{mk.group(1)}kcmil"
     return None
 
 def _extract_amp_any(text_in: str) -> str | None:
@@ -252,8 +258,15 @@ def _spec_adjust(specs: dict, cand_flags: dict, cfg: dict, q_base: str) -> float
     return adj
 
 
+# Strip trailing qty noise from search query (e.g. "... 6500 ML" or "... 300 M")
+_RE_TRAILING_QTY_NOISE = re.compile(r"\s+\d+(?:[.,]\d+)?\s*(?:ml|mts?|m|und|unid|pza|kg|rollo|rollos)\s*$", re.I)
+
+def _strip_qty_noise(q: str) -> str:
+    return _RE_TRAILING_QTY_NOISE.sub("", q).strip()
+
+
 # =========================
-# SQL recall (solo recall)
+# SQL recall (solo recall) — single-item fallback
 # =========================
 _SQL_RECALL = """
 SELECT
@@ -271,6 +284,39 @@ WHERE org_id=:org_id AND provider=:provider
 {extra_where}
 ORDER BY score_base DESC
 LIMIT :fetch_limit
+"""
+
+# =========================
+# SQL batch recall with LATERAL
+# =========================
+_SQL_BATCH_LATERAL = """
+WITH queries AS (
+  SELECT
+    unnest(:line_indexes ::int[])   AS line_index,
+    unnest(:enriched_queries ::text[]) AS q,
+    unnest(:cat_likes ::text[])     AS cat_like
+)
+SELECT q.line_index, q.q AS q_text,
+  cp.code, cp.name, cp.description, cp.brand, cp.model, cp.price1, cp.unit,
+  similarity(cp.search_text, unaccent(lower(q.q))) AS sim,
+  word_similarity(unaccent(lower(cp.name)), unaccent(lower(q.q))) AS wsim,
+  ts_rank(cp.search_tsv, websearch_to_tsquery('simple', unaccent(lower(q.q)))) AS rank,
+  (ts_rank(cp.search_tsv, websearch_to_tsquery('simple', unaccent(lower(q.q)))) * 2
+   + word_similarity(unaccent(lower(cp.name)), unaccent(lower(q.q))) * 2
+   + similarity(cp.search_text, unaccent(lower(q.q)))) AS score_base
+FROM queries q
+CROSS JOIN LATERAL (
+  SELECT code, name, description, brand, model, price1, unit, search_text, search_tsv
+  FROM catalog_products
+  WHERE org_id=:org_id AND provider=:provider
+    AND (q.cat_like IS NULL OR search_text ILIKE q.cat_like)
+  ORDER BY (
+    ts_rank(search_tsv, websearch_to_tsquery('simple', unaccent(lower(q.q)))) * 2
+    + word_similarity(unaccent(lower(name)), unaccent(lower(q.q))) * 2
+    + similarity(search_text, unaccent(lower(q.q)))
+  ) DESC
+  LIMIT :fetch_limit
+) cp
 """
 
 
@@ -312,54 +358,80 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
 
     results_out = []
 
+    # ---- Pre-process all items in Python (specs, enrichment, category) ----
+    prepared = []  # list of dicts with line_index, q_base, q_enriched, specs, raw_text
+    for it in items:
+        q_base = _strip_qty_noise((it["q"] or "").strip())
+        raw_text = (it.get("raw_text") or "").strip()
+        if not q_base:
+            continue
+
+        specs = _extract_specs(q_base, cfg)
+
+        q_enriched = q_base
+        if specs.get("cat") == "breaker" and specs.get("amp"):
+            q_enriched = f"breaker {specs['amp']}A {q_base}"
+        elif specs.get("cat") == "cable" and specs.get("awg"):
+            q_enriched = f"cable {specs['awg']} awg {q_base}"
+
+        # si raw trae keywords y no están en q_enriched, agregamos 1 keyword (solo recall)
+        all_kws = (cfg.get("keywords", {}).get("insulated", [])
+                  + cfg.get("keywords", {}).get("bare", [])
+                  + cfg.get("keywords", {}).get("roll", []))
+        for kw in all_kws:
+            if kw and _fold(kw) in _fold(raw_text) and _fold(kw) not in _fold(q_enriched):
+                q_enriched = f"{q_enriched} {kw}"
+                break
+
+        prepared.append({
+            "line_index": int(it["line_index"]),
+            "q_base": q_base,
+            "q_enriched": q_enriched,
+            "specs": specs,
+            "raw_text": raw_text,
+        })
+
+    if not prepared:
+        return {"draft_id": draft_id, "org_id": org_id, "provider": provider, "apply": apply, "items": []}
+
+    # ---- Batch SQL with LATERAL (one round-trip) ----
+    line_indexes = [p["line_index"] for p in prepared]
+    enriched_queries = [p["q_enriched"] for p in prepared]
+    cat_likes = [
+        f"%{p['specs']['cat']}%" if p["specs"].get("cat") else None
+        for p in prepared
+    ]
+
     with eng.begin() as conn:
-        for it in items:
-            q_base = (it["q"] or "").strip()
-            raw_text = (it.get("raw_text") or "").strip()
-            if not q_base:
-                continue
-
-            specs = _extract_specs(q_base, cfg)
-
-            q_enriched = q_base
-            if specs.get("cat") == "breaker" and specs.get("amp"):
-                q_enriched = f"breaker {specs['amp']}A {q_base}"
-            elif specs.get("cat") == "cable" and specs.get("awg"):
-                q_enriched = f"cable {specs['awg']} awg {q_base}"
-
-            # si raw trae keywords y no están en q_enriched, agregamos 1 keyword (solo recall)
-            all_kws = (cfg.get("keywords", {}).get("insulated", [])
-                      + cfg.get("keywords", {}).get("bare", [])
-                      + cfg.get("keywords", {}).get("roll", []))
-            for kw in all_kws:
-                if kw and _fold(kw) in _fold(raw_text) and _fold(kw) not in _fold(q_enriched):
-                    q_enriched = f"{q_enriched} {kw}"
-                    break
-
-            extra = []
-            params = {
+        batch_rows = conn.execute(
+            text(_SQL_BATCH_LATERAL),
+            {
+                "line_indexes": line_indexes,
+                "enriched_queries": enriched_queries,
+                "cat_likes": cat_likes,
                 "org_id": org_id,
                 "provider": provider,
-                "q": q_enriched,
                 "fetch_limit": fetch_limit,
-            }
+            },
+        ).mappings().all()
 
-            if specs.get("cat"):
-                extra.append("search_text ILIKE :cat_like")
-                params["cat_like"] = f"%{specs['cat']}%"
+        # Group results by line_index
+        rows_by_line: dict[int, list[dict]] = defaultdict(list)
+        for r in batch_rows:
+            rows_by_line[int(r["line_index"])].append(dict(r))
 
-            extra_where = ""
-            if extra:
-                extra_where = " AND " + " AND ".join(extra)
-
-            sql = _SQL_RECALL.format(extra_where=extra_where)
-            rows = conn.execute(text(sql), params).mappings().all()
+        # ---- Rerank and build output per item ----
+        for p in prepared:
+            li = p["line_index"]
+            rows = rows_by_line.get(li, [])
             if not rows:
                 continue
 
+            specs = p["specs"]
+            q_base = p["q_base"]
+
             reranked = []
-            for r in rows:
-                rdict = dict(r)
+            for rdict in rows:
                 flags = _candidate_flags(rdict, cfg)
                 adj = _spec_adjust(specs, flags, cfg, q_base=q_base)
                 score_base = float(rdict.get("score_base") or 0)
@@ -395,7 +467,7 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
                     """),
                     {
                         "draft_id": draft_id,
-                        "line_index": int(it["line_index"]),
+                        "line_index": li,
                         "code": selected["code"],
                         "name": selected["name"],
                         "sim": selected["sim"],
@@ -404,8 +476,8 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
                 )
 
             results_out.append({
-                "line_index": int(it["line_index"]),
-                "q": q_enriched,
+                "line_index": li,
+                "q": p["q_enriched"],
                 "selected": selected,
                 "candidates": [
                     {

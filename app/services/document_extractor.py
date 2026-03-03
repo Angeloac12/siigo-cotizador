@@ -1,11 +1,15 @@
 # app/services/document_extractor.py
 from __future__ import annotations
 
+import logging
 import os
-from typing import Optional, Tuple
+import re
+from typing import Optional, Tuple, List
 
-from app.schemas.extraction import ExtractionResult
+from app.schemas.extraction import ExtractionResult, ExtractedItem, Uom
 from app.services.local_fallback_parser import fallback_txt_lines_to_extraction
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentExtractor:
@@ -17,6 +21,89 @@ class DocumentExtractor:
 
     def _openai_enabled(self) -> bool:
         return os.getenv("OPENAI_ENABLED", "false").lower() == "true"
+
+    def _enrich_enabled(self) -> bool:
+        return os.getenv("OPENAI_ENRICH_ENABLED", "false").lower() == "true"
+
+    def _needs_enrichment(self, items: List[ExtractedItem]) -> bool:
+        """Check if any items would benefit from OpenAI enrichment."""
+        _AWG_RE = re.compile(r"awg|\bthhn\b|\bthwn\b|\btpx\b|\bacsr\b|\bkcmil\b", re.I)
+        for it in items:
+            # Low confidence items
+            if (it.confidence or 0) < 0.5:
+                return True
+            # Multi-conductor patterns in description without clear category
+            desc = (it.description or "").lower()
+            if re.search(r"\d[xX]\d{1,2}", desc) and _AWG_RE.search(desc):
+                return True
+        return False
+
+    def _enrich_with_openai(self, result: ExtractionResult, raw_text: str) -> ExtractionResult:
+        """Post-parse enrichment: send problematic items to OpenAI for correction."""
+        if not result.items:
+            return result
+
+        try:
+            from app.services.openai_extractor import OpenAIExtractor
+
+            # Convert items to dicts for the enrichment API
+            items_dicts = []
+            for it in result.items:
+                d = {
+                    "line_index": it.line_index,
+                    "description": it.description,
+                    "quantity": it.quantity,
+                    "uom": it.uom.value if isinstance(it.uom, Uom) else str(it.uom),
+                    "confidence": it.confidence,
+                    "warnings": it.warnings or [],
+                }
+                items_dicts.append(d)
+
+            enriched = OpenAIExtractor().enrich_items(items_dicts, raw_text)
+
+            if not enriched or len(enriched) != len(result.items):
+                return result
+
+            # Apply enriched data back to ExtractedItem objects
+            for orig, enr in zip(result.items, enriched):
+                if enr.get("description"):
+                    orig.description = str(enr["description"])[:160]
+                if "quantity" in enr:
+                    try:
+                        q = float(enr["quantity"])
+                        if q > 0:
+                            orig.quantity = q
+                    except (ValueError, TypeError):
+                        pass
+                if "uom" in enr:
+                    uom_str = str(enr["uom"]).upper()
+                    try:
+                        orig.uom = Uom(uom_str)
+                    except ValueError:
+                        pass
+                if "confidence" in enr:
+                    try:
+                        orig.confidence = float(enr["confidence"])
+                    except (ValueError, TypeError):
+                        pass
+                # Track enrichment in warnings
+                ws = list(orig.warnings or [])
+                if "OPENAI_ENRICHED" in (enr.get("warnings") or []):
+                    if "OPENAI_ENRICHED" not in ws:
+                        ws.append("OPENAI_ENRICHED")
+                    orig.warnings = ws
+
+            result.global_warnings = (result.global_warnings or []) + ["OPENAI_ENRICHMENT_APPLIED"]
+            result.meta = {**(result.meta or {}), "enrichment": "openai"}
+
+        except Exception as e:
+            logger.warning("OpenAI enrichment failed: %s", e)
+            result.global_warnings = (result.global_warnings or []) + [
+                "OPENAI_ENRICHMENT_FAILED",
+                f"ENRICH_ERROR_{e.__class__.__name__}",
+            ]
+
+        return result
 
     def detect(self, source_path: str, filename: str | None, content_type: str | None) -> str:
         name = (filename or "").lower()
@@ -80,10 +167,15 @@ class DocumentExtractor:
             local_res = fallback_txt_lines_to_extraction(text)
             local_res.meta = {**(local_res.meta or {}), "extractor": "local", "model": "local-fallback-v1", "source_type": "txt"}
 
-            # Heurística simple: si local ya encontró items suficientes -> NO OpenAI (MVP/demo)
+            # Heurística simple: si local ya encontró items suficientes -> NO OpenAI full extraction
             min_items = int(os.getenv("LOCAL_FIRST_MIN_ITEMS", "1"))
             if len(local_res.items) >= min_items:
                 local_res.global_warnings = (local_res.global_warnings or []) + ["LOCAL_FIRST_USED", "SKIPPED_OPENAI"]
+
+                # Post-parse enrichment: if enabled and items need it, ask OpenAI to fix them
+                if self._enrich_enabled() and self._needs_enrichment(local_res.items):
+                    local_res = self._enrich_with_openai(local_res, text)
+
                 return self._enforce_max_items(local_res)
 
             # 1) Si local NO encontró items, ahí sí intenta OpenAI (si está habilitado)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, Optional, List
 
 from openai import OpenAI
@@ -409,6 +410,110 @@ class OpenAIExtractor:
             "- No conviertas precios ni valores en COP a quantity.\n"
             "- Si el PDF tiene tabla, úsala para identificar cantidad y descripción.\n"
         )
+
+    # -------------------------
+    # Enrichment (post-parse correction)
+    # -------------------------
+    def enrich_items(
+        self,
+        items: list[dict],
+        raw_text: str,
+    ) -> list[dict]:
+        """
+        Takes locally-parsed items + raw text and asks GPT to fix/enrich
+        only the problematic ones (low confidence, multi-conductor, etc.).
+        Returns the corrected items list (same structure).
+        """
+        if not items:
+            return items
+
+        prompt = (
+            "Eres un asistente experto en materiales eléctricos.\n"
+            "Te doy una lista de ítems extraídos de una solicitud de cotización (RFQ) por un parser local.\n"
+            "Algunos ítems pueden tener cantidades incorrectas, unidades mal asignadas, o descripciones con ruido.\n"
+            "El texto original de la RFQ puede tener encabezados de sección (ej: 'CABLE TPX', 'ACSR') que aplican\n"
+            "a los ítems debajo de ellos.\n\n"
+            "REGLAS:\n"
+            "- Corrige quantity y uom si están mal (ej: si '3' se tomó como qty pero en realidad es parte de '3x12AWG').\n"
+            "- Si un encabezado de sección (ej: 'CABLE TPX 600V') aporta contexto al producto, inclúyelo en la description.\n"
+            "- Normaliza descripciones multi-conductor: '3x12AWG CuTHHN TPX 600V 90C' es una descripción válida.\n"
+            "- uom válidas: UND, M, KG, ROL, EA, BOX, SET, L, GAL, PACK.\n"
+            "- 'ML' significa 'metros lineales' → uom = 'M'.\n"
+            "- NO inventes ítems nuevos. Solo corrige los que te paso.\n"
+            "- Devuelve SOLO el JSON array con los ítems corregidos.\n\n"
+            f"TEXTO ORIGINAL DE LA RFQ:\n{raw_text[:3000]}\n\n"
+            f"ÍTEMS PARSEADOS (JSON):\n{json.dumps(items, ensure_ascii=False)}\n\n"
+            "Devuelve un JSON array con los ítems corregidos. Cada ítem debe tener:\n"
+            "line_index, description, quantity, uom, confidence\n"
+        )
+
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                ],
+                temperature=0,
+                max_output_tokens=_min_tokens(
+                    int(os.getenv("OPENAI_ENRICH_MAX_TOKENS", "2000"))
+                ),
+            )
+
+            out_text = getattr(resp, "output_text", None) or ""
+            # Try to parse JSON from the response
+            # Strip markdown code fences if present
+            cleaned = out_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                cleaned = re.sub(r"\s*```$", "", cleaned)
+
+            enriched = json.loads(cleaned)
+
+            if not isinstance(enriched, list):
+                return items
+
+            # Merge enriched data back into original items by line_index
+            enriched_map = {}
+            for ei in enriched:
+                if isinstance(ei, dict) and "line_index" in ei:
+                    enriched_map[ei["line_index"]] = ei
+
+            result = []
+            for orig in items:
+                li = orig.get("line_index")
+                if li in enriched_map:
+                    e = enriched_map[li]
+                    merged = dict(orig)
+                    if "description" in e and e["description"]:
+                        merged["description"] = str(e["description"])[:160]
+                    if "quantity" in e:
+                        try:
+                            q = float(e["quantity"])
+                            if q > 0:
+                                merged["quantity"] = q
+                        except (ValueError, TypeError):
+                            pass
+                    if "uom" in e and str(e["uom"]).upper() in {
+                        "UND", "M", "KG", "ROL", "EA", "BOX", "SET", "L", "GAL", "PACK"
+                    }:
+                        merged["uom"] = str(e["uom"]).upper()
+                    if "confidence" in e:
+                        try:
+                            merged["confidence"] = float(e["confidence"])
+                        except (ValueError, TypeError):
+                            pass
+                    merged.setdefault("warnings", [])
+                    if isinstance(merged["warnings"], list):
+                        merged["warnings"].append("OPENAI_ENRICHED")
+                    result.append(merged)
+                else:
+                    result.append(orig)
+
+            return result
+
+        except Exception:
+            # If enrichment fails, return original items unchanged
+            return items
 
     # -------------------------
     # JSON schema para Structured Outputs
