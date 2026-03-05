@@ -569,8 +569,17 @@ async def commit_quote(draft_id: str, request: Request):
     
 
     def _strip_leading_qty_uom(s: str) -> str:
-        # quita "2 und", "8 m", "10 mts", etc al inicio
-        return re.sub(r"^\s*\d+(?:[.,]\d+)?\s*(und|un|unidad(?:es)?|m|mt|mts|metro(?:s)?)\b\s*", "", (s or "").strip(), flags=re.I)
+        # quita "2 und", "8 m", "10 mts", "1 ROL", "5 cajas", etc al inicio
+        s = re.sub(
+            r"^\s*\d+(?:[.,]\d+)?\s*"
+            r"(?:und|un|unidad(?:es)?|m|mt|mts|metro(?:s)?|rollo(?:s)?|rol"
+            r"|caja(?:s)?|box|kg|kilo(?:s)?|gal(?:on(?:es)?)?|l(?:itro(?:s)?)?|pack"
+            r"|ea|set|pza|pieza(?:s)?)\b\s*",
+            "", (s or "").strip(), flags=re.I,
+        )
+        # quita conectores que quedan al inicio: "de", "del", "x", "por"
+        s = re.sub(r"^(?:de|del|x|por)\s+", "", s, flags=re.I)
+        return s.strip()
 
     # -------------------------
     # 0) Leer body (JSON o FORM) y validar
@@ -762,11 +771,9 @@ async def commit_quote(draft_id: str, request: Request):
             else:
                 base = (r.get("description") or "").strip() or (r.get("raw_text") or "").strip()
 
-            # ✅ AQUÍ va esto (antes del prefix)
+            # Clean description: strip any accidental leading qty/uom
             base = _strip_leading_qty_uom(base)
-
-            prefix = f"{qty:g} {uom}".strip() if (qty and uom) else ""
-            desc = f"{prefix} {base}".strip() if prefix else base
+            desc = base
 
         items.append(
             {

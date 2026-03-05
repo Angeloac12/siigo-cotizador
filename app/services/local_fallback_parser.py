@@ -236,6 +236,8 @@ def _extract_qty_uom_desc(raw: str):
         warnings.append("UOM_INFERRED")
 
     desc2 = (desc or "").strip()
+    # Strip leading Spanish connectors left over after qty+unit removal
+    desc2 = re.sub(r"^(?:de|del|x|por)\s+", "", desc2, flags=re.IGNORECASE).strip()
     if not desc2:
         desc2 = raw_clean
         warnings.append("DESCRIPTION_FALLBACK")
