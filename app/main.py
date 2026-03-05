@@ -25,6 +25,7 @@ from typing import Optional
 from app.api.routes_matching import router as matching_router
 from app.db_engine import get_engine
 from app.api.routes_overrides import router as overrides_router
+from app.api.routes_rut import router as rut_router
 
 
 
@@ -60,6 +61,7 @@ app.include_router(quote_drafts_router)
 app.include_router(catalog_router)
 app.include_router(matching_router)
 app.include_router(overrides_router)
+app.include_router(rut_router)
 
 
 def new_correlation_id() -> str:
