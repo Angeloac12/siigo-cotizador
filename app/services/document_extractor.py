@@ -32,6 +32,9 @@ class DocumentExtractor:
             # Low confidence items
             if (it.confidence or 0) < 0.5:
                 return True
+            # Items kept despite low confidence
+            if it.warnings and "LOW_CONFIDENCE_KEPT" in it.warnings:
+                return True
             # Multi-conductor patterns in description without clear category
             desc = (it.description or "").lower()
             if re.search(r"\d[xX]\d{1,2}", desc) and _AWG_RE.search(desc):

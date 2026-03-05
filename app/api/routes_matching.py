@@ -14,6 +14,9 @@ router = APIRouter(prefix="/v1", tags=["matching"])
 def _enabled() -> bool:
     return (os.getenv("ENABLE_MATCHING") or "").lower() in ("1", "true", "yes", "y", "on")
 
+def _always_suggest() -> bool:
+    return os.getenv("ALWAYS_SUGGEST", "true").lower() in ("1", "true", "yes", "y")
+
 
 # =========================
 # Multi-tenant config
@@ -369,7 +372,8 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
             text("""
                 SELECT line_index,
                        COALESCE(NULLIF(description,''), raw_text) AS q,
-                       raw_text
+                       raw_text,
+                       warnings_json
                 FROM draft_items
                 WHERE draft_id=:draft_id
                 ORDER BY line_index
@@ -384,14 +388,32 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
     results_out = []
 
     # ---- Pre-process all items in Python (specs, enrichment, category) ----
-    prepared = []  # list of dicts with line_index, q_base, q_enriched, specs, raw_text
+    prepared = []  # list of dicts with line_index, q_base, q_enriched, specs, raw_text, is_low_confidence
     for it in items:
         q_base = _strip_qty_noise((it["q"] or "").strip())
         raw_text = (it.get("raw_text") or "").strip()
         if not q_base:
             continue
 
+        # Parse item warnings
+        item_warnings_raw = it.get("warnings_json")
+        if isinstance(item_warnings_raw, str):
+            try:
+                item_warnings_list = json.loads(item_warnings_raw)
+            except Exception:
+                item_warnings_list = []
+        elif isinstance(item_warnings_raw, list):
+            item_warnings_list = item_warnings_raw
+        else:
+            item_warnings_list = []
+
+        is_low_confidence = "LOW_CONFIDENCE_KEPT" in item_warnings_list
+
         specs = _extract_specs(q_base, cfg)
+
+        # For low-confidence items, skip category filter (broader recall)
+        if is_low_confidence:
+            specs["cat"] = None
 
         q_enriched = q_base
         if specs.get("cat") == "breaker" and specs.get("amp"):
@@ -414,6 +436,7 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
             "q_enriched": q_enriched,
             "specs": specs,
             "raw_text": raw_text,
+            "is_low_confidence": is_low_confidence,
         })
 
     if not prepared:
@@ -446,11 +469,45 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
             rows_by_line[int(r["line_index"])].append(dict(r))
 
         # ---- Rerank and build output per item ----
+        always_suggest = _always_suggest()
+        unmatched_line_indexes = []
+
         for p in prepared:
             li = p["line_index"]
             rows = rows_by_line.get(li, [])
+            item_warnings = []
+
+            # Fallback: if no rows from batch lateral, try without category filter
+            if not rows and always_suggest:
+                fallback_rows = conn.execute(
+                    text(_SQL_RECALL.format(extra_where="")),
+                    {
+                        "q": p["q_enriched"],
+                        "org_id": org_id,
+                        "provider": provider,
+                        "fetch_limit": fetch_limit,
+                    },
+                ).mappings().all()
+                rows = [dict(r) for r in fallback_rows]
+                if rows:
+                    item_warnings.append("FALLBACK_NO_CATEGORY")
+
             if not rows:
+                if always_suggest:
+                    # Still include item with no candidates
+                    unmatched_line_indexes.append(li)
+                    results_out.append({
+                        "line_index": li,
+                        "q": p["q_enriched"],
+                        "selected": None,
+                        "candidates": [],
+                        "specs": p["specs"] or None,
+                        "warnings": ["NO_MATCH_FOUND"] + (["LOW_CONFIDENCE_KEPT"] if p.get("is_low_confidence") else []),
+                    })
                 continue
+
+            if p.get("is_low_confidence"):
+                item_warnings.append("LOW_CONFIDENCE_KEPT")
 
             specs = p["specs"]
             q_base = p["q_base"]
@@ -520,8 +577,11 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
                     for x in top
                 ],
                 "specs": specs or None,
-                "warnings": None,
+                "warnings": item_warnings or None,
             })
+
+    total_input = len(prepared)
+    matched = len([r for r in results_out if r.get("selected") is not None])
 
     return {
         "draft_id": draft_id,
@@ -529,6 +589,12 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
         "provider": provider,
         "apply": apply,
         "items": results_out,
+        "report": {
+            "total_input_items": total_input,
+            "matched_items": matched,
+            "unmatched_items": total_input - matched,
+            "unmatched_line_indexes": unmatched_line_indexes,
+        },
     }
 
 

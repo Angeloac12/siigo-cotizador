@@ -249,12 +249,19 @@ def _extract_qty_uom_desc(raw: str):
     return float(qty), uom, desc2, warnings, conf, uom_raw
 
 
+def _keep_low_confidence() -> bool:
+    return os.getenv("KEEP_LOW_CONFIDENCE_ITEMS", "true").lower() in ("1", "true", "yes", "y")
+
+
 def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> ExtractionResult:
     items: List[ExtractedItem] = []
     global_warnings: List[str] = []
 
     lines = [ln.strip() for ln in (text or "").splitlines()]
     lines = [ln for ln in lines if ln]
+    input_line_count = len(lines)
+
+    keep_low = _keep_low_confidence()
 
     for idx, ln in enumerate(lines):
         if len(items) >= max_items:
@@ -264,7 +271,9 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
         qty, uom, desc, warnings, conf, uom_raw = _extract_qty_uom_desc(ln)
 
         if "QTY_INFERRED" in warnings and "UOM_INFERRED" in warnings and conf < 0.5:
-            continue
+            if not keep_low:
+                continue
+            warnings.append("LOW_CONFIDENCE_KEPT")
 
         items.append(
             ExtractedItem(
@@ -282,7 +291,8 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
     return ExtractionResult(
         items=items,
         global_warnings=global_warnings or None,
-        meta={"source_type": "txt", "extractor": "local", "model": "local-fallback-v1"},
+        meta={"source_type": "txt", "extractor": "local", "model": "local-fallback-v1",
+              "input_line_count": input_line_count},
     )
 
 

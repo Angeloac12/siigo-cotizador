@@ -439,6 +439,8 @@ class OpenAIExtractor:
             "- Normaliza descripciones multi-conductor: '3x12AWG CuTHHN TPX 600V 90C' es una descripción válida.\n"
             "- uom válidas: UND, M, KG, ROL, EA, BOX, SET, L, GAL, PACK.\n"
             "- 'ML' significa 'metros lineales' → uom = 'M'.\n"
+            "- Si la descripción es lenguaje natural ambiguo, normalízala a formato de catálogo: "
+            "[tipo producto] [especificaciones] [material] [norma].\n"
             "- NO inventes ítems nuevos. Solo corrige los que te paso.\n"
             "- Devuelve SOLO el JSON array con los ítems corregidos.\n\n"
             f"TEXTO ORIGINAL DE LA RFQ:\n{raw_text[:3000]}\n\n"

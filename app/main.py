@@ -310,12 +310,14 @@ def parse_draft(draft_id: str, request: Request):
             },
         )
 
+    meta = result.meta or {}
     return {
         "draft_id": draft_id,
         "status": "PARSED",
         "items_created": len(result.items),
+        "input_line_count": meta.get("input_line_count"),
         "warnings": result.global_warnings or [],
-        "meta": result.meta or {},
+        "meta": meta,
     }
 
 
@@ -777,6 +779,16 @@ async def commit_quote(draft_id: str, request: Request):
     
     
 
+    # Warn about items using default fallback code
+    default_code_lines = [i for i, it in enumerate(items) if it.get("code") == "2543"]
+    commit_warnings = []
+    if default_code_lines:
+        commit_warnings.append({
+            "code": "DEFAULT_CODE_USED",
+            "message": f"{len(default_code_lines)} item(s) using default code 2543 (no catalog match).",
+            "line_indexes": default_code_lines,
+        })
+
     if document_id <= 0:
         raise HTTPException(status_code=409, detail={"code": "MISSING_DOCUMENT_ID"})
 
@@ -797,6 +809,7 @@ async def commit_quote(draft_id: str, request: Request):
             "draft_status": draft["status"],
             "dry_run": True,
             "siigo_quote_payload": quote_payload,
+            "commit_warnings": commit_warnings,
             "notes": {
                 "defaults_used": {
                     "customer_identification": str(customer_identification),
