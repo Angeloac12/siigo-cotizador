@@ -183,10 +183,33 @@ async def process_quote_draft(
     ct = file.content_type or "application/octet-stream"
 
     raw_text = ""
-    try:
-        raw_text = file_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        raw_text = ""
+    is_binary = ct.startswith("application/pdf") or ct.startswith("image/")
+    if is_binary:
+        # For PDF: extract text with pypdf instead of garbage UTF-8 decode
+        if ct.startswith("application/pdf"):
+            try:
+                import tempfile
+                from pypdf import PdfReader
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    tmp.write(file_bytes)
+                    tmp_path = tmp.name
+                reader = PdfReader(tmp_path)
+                pages_text = []
+                for page in reader.pages:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        pages_text.append(t)
+                raw_text = "\n".join(pages_text)
+                import os as _os
+                _os.unlink(tmp_path)
+            except Exception:
+                raw_text = ""
+        # For images: no text to extract locally
+    else:
+        try:
+            raw_text = file_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            raw_text = ""
 
     if file_len == 0:
         raise HTTPException(

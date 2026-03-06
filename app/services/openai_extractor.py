@@ -115,6 +115,26 @@ class OpenAIExtractor:
     def extract_from_pdf(self, pdf_path: str) -> ExtractionResult:
         return self.normalize_from_pdf(pdf_path)
 
+    def extract_from_image(self, img_bytes: bytes, mime: str = "image/jpeg") -> ExtractionResult:
+        """Extract items from an image using OpenAI vision (base64-encoded)."""
+        import base64
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+
+        return self._call_openai(
+            user_content=[
+                {
+                    "type": "input_image",
+                    "image_url": data_url,
+                },
+                {
+                    "type": "input_text",
+                    "text": self._prompt_for_image(),
+                },
+            ],
+            source_type="image",
+        )
+
     # -------------------------
     # Internals
     # -------------------------
@@ -399,6 +419,17 @@ class OpenAIExtractor:
             "- NO crees items para filas de totales, subtotales, IVA, retenciones ni 'Total a Pagar'.\n"
             "- No conviertas precios ni valores monetarios en quantity.\n\n"
             f"TABLA:\n{table_text}"
+        )
+
+    def _prompt_for_image(self) -> str:
+        return (
+            "Esta imagen contiene una solicitud de cotización o listado de materiales.\n"
+            "- Detecta solo las líneas que describen productos o servicios con cantidades físicas.\n"
+            "- NO debes crear items para filas de resumen como 'Total Bruto', 'Subtotal', 'IVA',\n"
+            "  'Retefuente', 'Total a Pagar', 'Abono', 'Saldo' u otros totales.\n"
+            "- No conviertas precios ni valores en COP a quantity.\n"
+            "- Si la imagen tiene tabla, úsala para identificar cantidad y descripción.\n"
+            "- Si el texto es manuscrito, haz tu mejor esfuerzo para transcribir los ítems.\n"
         )
 
     def _prompt_for_pdf(self) -> str:

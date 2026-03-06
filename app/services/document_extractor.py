@@ -320,14 +320,49 @@ class DocumentExtractor:
                 pdf_path = source_path
                 truncated = False
 
+            # 0) LOCAL FIRST: extract text with pypdf and run local parser
+            pdf_text = ""
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(pdf_path)
+                pages_text = []
+                for page in reader.pages:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        pages_text.append(t)
+                pdf_text = "\n".join(pages_text)
+            except Exception as e:
+                logger.warning("pypdf text extraction failed: %s", e)
+                pdf_text = ""
+
+            if pdf_text.strip():
+                local_res = fallback_txt_lines_to_extraction(pdf_text)
+                local_res.meta = {**(local_res.meta or {}), "extractor": "local", "model": "local-fallback-v1", "source_type": "pdf"}
+
+                min_items = int(os.getenv("LOCAL_FIRST_MIN_ITEMS", "1"))
+                if len(local_res.items) >= min_items:
+                    local_res.global_warnings = (local_res.global_warnings or []) + ["LOCAL_FIRST_USED", "SKIPPED_OPENAI", "PDF_TEXT_EXTRACTED"]
+
+                    # Post-parse enrichment if enabled
+                    if self._enrich_enabled() and self._needs_enrichment(local_res.items):
+                        local_res = self._enrich_with_openai(local_res, pdf_text)
+
+                    if truncated:
+                        local_res.global_warnings = (local_res.global_warnings or []) + ["TRUNCATED_PDF_PAGES"]
+
+                    return self._enforce_max_items(local_res)
+
+            # 1) If local extraction found 0 items, try OpenAI (if enabled)
             if self._openai_enabled():
                 try:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().extract_from_pdf(pdf_path)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
-                
+
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(text)
+                    # OpenAI failed — use local pdf_text if available
+                    fallback_source = pdf_text if pdf_text.strip() else f"[uploaded pdf: {filename or 'document.pdf'}]"
+                    res = fallback_txt_lines_to_extraction(fallback_source)
                     res.global_warnings = (res.global_warnings or []) + [
                         "OPENAI_FAILED",
                         f"OPENAI_ERROR_{e.__class__.__name__}",
@@ -339,18 +374,15 @@ class DocumentExtractor:
                         "model": "local-fallback-v1",
                         "openai_error_class": e.__class__.__name__,
                         "openai_error_message": str(e),
-                        "fallback_used": True,
-                    }
-
-                    res.meta = {
-                        **(res.meta or {}),
-                        "extractor": "local",
-                        "model": "local-fallback-v1",
-                        "openai_error_class": e.__class__.__name__,
-                        "openai_error_message": str(e),
                     }
             else:
-                res = fallback_txt_lines_to_extraction(f"[uploaded pdf: {filename or 'document.pdf'}]")
+                # OpenAI disabled — return local result (may be empty) with warning
+                if pdf_text.strip():
+                    res = fallback_txt_lines_to_extraction(pdf_text)
+                    res.global_warnings = (res.global_warnings or []) + ["PDF_NO_TEXT_EXTRACTED"]
+                else:
+                    res = fallback_txt_lines_to_extraction(f"[uploaded pdf: {filename or 'document.pdf'}]")
+                    res.global_warnings = (res.global_warnings or []) + ["PDF_NO_TEXT_EXTRACTED"]
                 res.meta = {**(res.meta or {}), "extractor": "local", "model": "local-fallback-v1"}
 
             if truncated:
@@ -372,31 +404,27 @@ class DocumentExtractor:
                
                 
                 except Exception as e:
-                    res = fallback_txt_lines_to_extraction(text)
-                    res.global_warnings = (res.global_warnings or []) + [
-                        "OPENAI_FAILED",
-                        f"OPENAI_ERROR_{e.__class__.__name__}",
-                        "FALLBACK_LOCAL_USED",
-                    ]
-                    res.meta = {
-                        **(res.meta or {}),
-                        "extractor": "local",
-                        "model": "local-fallback-v1",
-                        "openai_error_class": e.__class__.__name__,
-                        "openai_error_message": str(e),
-                        "fallback_used": True,
-                    }
-
-                    res.meta = {
-                        **(res.meta or {}),
-                        "extractor": "local",
-                        "model": "local-fallback-v1",
-                        "openai_error_class": e.__class__.__name__,
-                        "openai_error_message": str(e),
-                    }
+                    res = ExtractionResult(
+                        items=[],
+                        global_warnings=[
+                            "OPENAI_FAILED",
+                            f"OPENAI_ERROR_{e.__class__.__name__}",
+                            "FALLBACK_LOCAL_USED",
+                        ],
+                        meta={
+                            "extractor": "local",
+                            "model": "local-fallback-v1",
+                            "openai_error_class": e.__class__.__name__,
+                            "openai_error_message": str(e),
+                        },
+                    )
             else:
-                res = fallback_txt_lines_to_extraction(f"[uploaded image: {filename or 'image'}]")
-                res.meta = {**(res.meta or {}), "extractor": "local", "model": "local-fallback-v1"}
+                res = ExtractionResult(
+                    items=[],
+                    global_warnings=["IMAGE_REQUIRES_OPENAI"],
+                    meta={"extractor": "local", "model": "local-fallback-v1",
+                          "error_message": "La extracción de imágenes requiere procesamiento adicional no disponible"},
+                )
 
             res.meta = {**(res.meta or {}), "source_type": "image"}
             return self._enforce_max_items(res)
