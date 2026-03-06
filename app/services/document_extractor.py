@@ -320,7 +320,7 @@ class DocumentExtractor:
                 pdf_path = source_path
                 truncated = False
 
-            # 0) LOCAL FIRST: extract text with pypdf and run local parser
+            # 0) Extract text with pypdf (needed for local fallback)
             pdf_text = ""
             try:
                 from pypdf import PdfReader
@@ -335,32 +335,29 @@ class DocumentExtractor:
                 logger.warning("pypdf text extraction failed: %s", e)
                 pdf_text = ""
 
-            if pdf_text.strip():
-                local_res = fallback_txt_lines_to_extraction(pdf_text)
-                local_res.meta = {**(local_res.meta or {}), "extractor": "local", "model": "local-fallback-v1", "source_type": "pdf"}
-
-                min_items = int(os.getenv("LOCAL_FIRST_MIN_ITEMS", "1"))
-                if len(local_res.items) >= min_items:
-                    local_res.global_warnings = (local_res.global_warnings or []) + ["LOCAL_FIRST_USED", "SKIPPED_OPENAI", "PDF_TEXT_EXTRACTED"]
-
-                    # Post-parse enrichment if enabled
-                    if self._enrich_enabled() and self._needs_enrichment(local_res.items):
-                        local_res = self._enrich_with_openai(local_res, pdf_text)
-
-                    if truncated:
-                        local_res.global_warnings = (local_res.global_warnings or []) + ["TRUNCATED_PDF_PAGES"]
-
-                    return self._enforce_max_items(local_res)
-
-            # 1) If local extraction found 0 items, try OpenAI (if enabled)
+            # 1) Try OpenAI first (if enabled)
             if self._openai_enabled():
                 try:
                     from app.services.openai_extractor import OpenAIExtractor
                     res = OpenAIExtractor().extract_from_pdf(pdf_path)
                     res.meta = {**(res.meta or {}), "extractor": "openai", "model": self.model}
 
+                    # If OpenAI returned 0 items, fall back to local
+                    if len(res.items) == 0 and pdf_text.strip():
+                        logger.warning("OpenAI returned 0 items for PDF, falling back to local parser")
+                        res = fallback_txt_lines_to_extraction(pdf_text)
+                        res.global_warnings = (res.global_warnings or []) + [
+                            "OPENAI_EMPTY_RESULT",
+                            "FALLBACK_LOCAL_USED",
+                        ]
+                        res.meta = {**(res.meta or {}), "extractor": "local", "model": "local-fallback-v1"}
+
+                        if self._enrich_enabled() and self._needs_enrichment(res.items):
+                            res = self._enrich_with_openai(res, pdf_text)
+
                 except Exception as e:
                     # OpenAI failed — use local pdf_text if available
+                    logger.warning("OpenAI PDF extraction failed: %s — falling back to local", e)
                     fallback_source = pdf_text if pdf_text.strip() else f"[uploaded pdf: {filename or 'document.pdf'}]"
                     res = fallback_txt_lines_to_extraction(fallback_source)
                     res.global_warnings = (res.global_warnings or []) + [
@@ -375,15 +372,18 @@ class DocumentExtractor:
                         "openai_error_class": e.__class__.__name__,
                         "openai_error_message": str(e),
                     }
+
+                    if self._enrich_enabled() and self._needs_enrichment(res.items):
+                        res = self._enrich_with_openai(res, pdf_text)
             else:
-                # OpenAI disabled — return local result (may be empty) with warning
-                if pdf_text.strip():
-                    res = fallback_txt_lines_to_extraction(pdf_text)
-                    res.global_warnings = (res.global_warnings or []) + ["PDF_NO_TEXT_EXTRACTED"]
-                else:
-                    res = fallback_txt_lines_to_extraction(f"[uploaded pdf: {filename or 'document.pdf'}]")
-                    res.global_warnings = (res.global_warnings or []) + ["PDF_NO_TEXT_EXTRACTED"]
+                # 2) OpenAI disabled — local parser only
+                fallback_source = pdf_text if pdf_text.strip() else f"[uploaded pdf: {filename or 'document.pdf'}]"
+                res = fallback_txt_lines_to_extraction(fallback_source)
+                res.global_warnings = (res.global_warnings or []) + ["OPENAI_DISABLED", "FALLBACK_LOCAL_USED"]
                 res.meta = {**(res.meta or {}), "extractor": "local", "model": "local-fallback-v1"}
+
+                if pdf_text.strip() and self._enrich_enabled() and self._needs_enrichment(res.items):
+                    res = self._enrich_with_openai(res, pdf_text)
 
             if truncated:
                 res.global_warnings = (res.global_warnings or []) + ["TRUNCATED_PDF_PAGES"]

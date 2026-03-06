@@ -88,9 +88,9 @@ class TestDocumentExtractorPdf:
             assert result.items, "Should extract at least 1 item from text PDF"
             assert result.meta.get("source_type") == "pdf"
             assert result.meta.get("extractor") == "local"
-            # Should have skipped OpenAI
+            # OpenAI disabled → local fallback used
             warnings = result.global_warnings or []
-            assert "LOCAL_FIRST_USED" in warnings or "PDF_TEXT_EXTRACTED" in warnings
+            assert "FALLBACK_LOCAL_USED" in warnings
         finally:
             os.unlink(path)
 
@@ -112,7 +112,7 @@ class TestDocumentExtractorPdf:
 
                 # Should not crash, should have warning
                 warnings = result.global_warnings or []
-                assert "PDF_NO_TEXT_EXTRACTED" in warnings
+                assert "OPENAI_DISABLED" in warnings or "FALLBACK_LOCAL_USED" in warnings
                 assert result.meta.get("source_type") == "pdf"
             finally:
                 if old is not None:
