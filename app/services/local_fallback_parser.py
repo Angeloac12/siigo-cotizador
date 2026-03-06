@@ -251,6 +251,78 @@ def _extract_qty_uom_desc(raw: str):
     return float(qty), uom, desc2, warnings, conf, uom_raw
 
 
+_JUNK_PATTERNS = [
+    re.compile(p, flags=re.IGNORECASE) for p in [
+        # NIT / tax IDs
+        r"NIT\s*\d",
+        r"\d{3}\.\d{3}\.\d{3}[-–]\d",
+        # Phone numbers
+        r"Tel[.:éf]",
+        r"Cel[.:]",
+        # Addresses (Colombian formats)
+        r"(?:Calle|Carrera|Cra|Kra|Diagonal|Transversal)\s+\d",
+        r"Av\.\s",
+        r"#\s*\d+\s*[-–]\s*\d+",
+        # Email
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        # URLs
+        r"^(?:www\.|https?://)",
+        # Financial summary
+        r"^\s*(?:Total|Subtotal|Sub\s*total|IVA|Retefuente|Reteica|Retención|Descuento|Neto|Gran\s*total)\b",
+        # Page headers/footers
+        r"P[áa]g(?:ina)?\.?\s*\d",
+        # Date-only lines
+        r"^\s*\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\s*$",
+    ]
+]
+
+_COLOMBIAN_CITIES = {
+    "bogota", "bogotá", "medellin", "medellín", "cali", "barranquilla",
+    "cartagena", "bucaramanga", "pereira", "manizales", "cucuta", "cúcuta",
+    "ibague", "ibagué", "santa marta", "villavicencio", "pasto", "monteria",
+    "montería", "neiva", "armenia", "popayan", "popayán", "sincelejo",
+    "valledupar", "tunja", "florencia", "riohacha", "quibdo", "quibdó",
+    "mocoa", "yopal", "leticia", "inirida", "inírida", "san jose del guaviare",
+    "san josé del guaviare", "puerto carreño", "mitu", "mitú",
+}
+
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\b(?:S\.?A\.?S\.?|S\.?A\.?|LTDA\.?|E\.?U\.?|S\.?\s*EN\s*C\.?)\s*\.?\s*$",
+    flags=re.IGNORECASE,
+)
+
+_MOSTLY_DIGITS_RE = re.compile(r"^[\d\s\-\(\)\+\.]{10,}$")
+
+
+def _is_junk_line(line: str) -> bool:
+    """Return True if *line* looks like non-product metadata (header, address, etc.)."""
+    stripped = line.strip()
+
+    # Very short lines (< 3 chars) – page artifacts
+    if len(stripped) < 3:
+        return True
+
+    # Compiled regex patterns
+    for pat in _JUNK_PATTERNS:
+        if pat.search(stripped):
+            return True
+
+    # Mostly-digits line (phone numbers without prefix)
+    if _MOSTLY_DIGITS_RE.match(stripped):
+        return True
+
+    # City names (with optional " - Colombia" suffix)
+    norm = re.sub(r"\s*[-–]\s*colombia\s*$", "", stripped, flags=re.IGNORECASE).strip()
+    if norm.lower() in _COLOMBIAN_CITIES:
+        return True
+
+    # Short lines ending with legal suffixes (company names)
+    if len(stripped) < 60 and _LEGAL_SUFFIX_RE.search(stripped):
+        return True
+
+    return False
+
+
 def _keep_low_confidence() -> bool:
     return os.getenv("KEEP_LOW_CONFIDENCE_ITEMS", "true").lower() in ("1", "true", "yes", "y")
 
@@ -264,11 +336,16 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
     input_line_count = len(lines)
 
     keep_low = _keep_low_confidence()
+    junk_skipped = 0
 
     for idx, ln in enumerate(lines):
         if len(items) >= max_items:
             global_warnings.append("TRUNCATED_ITEMS_MAX_ITEMS")
             break
+
+        if _is_junk_line(ln):
+            junk_skipped += 1
+            continue
 
         qty, uom, desc, warnings, conf, uom_raw = _extract_qty_uom_desc(ln)
 
@@ -289,6 +366,9 @@ def fallback_txt_lines_to_extraction(text: str, max_items: int = 200) -> Extract
                 warnings=warnings or None,
             )
         )
+
+    if junk_skipped:
+        global_warnings.append(f"JUNK_LINES_SKIPPED:{junk_skipped}")
 
     return ExtractionResult(
         items=items,
