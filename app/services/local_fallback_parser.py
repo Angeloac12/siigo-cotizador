@@ -214,7 +214,10 @@ def _extract_qty_uom_desc(raw: str):
         if m:
             left = (m.group(1) or "").strip()
             qty2 = _to_float(m.group(2))
-            if qty2 is not None and qty2 > 0:
+            # Una "x" pegada entre dígitos es una medida ("canaleta 8x4", "breaker 2x40"),
+            # no un separador de cantidad: ahí el número final es parte de la descripción.
+            is_dimension = bool(left) and left[-1].isdigit()
+            if qty2 is not None and qty2 > 0 and not is_dimension:
                 qty = qty2
                 uom = Uom.UND
                 desc = left

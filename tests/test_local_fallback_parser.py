@@ -68,3 +68,19 @@ def test_totals_line_does_not_become_quantity():
 
     assert res.items[0].quantity == 1
     assert "QTY_INFERRED" in (res.items[0].warnings or [])
+
+
+def test_trailing_dimension_is_not_a_quantity():
+    # La "x" pegada entre dígitos es medida, no separador de cantidad.
+    res = fallback_txt_lines_to_extraction("3 UND canaleta 8x4\nBreaker enchufable 2x40\n")
+
+    assert [it.quantity for it in res.items] == [3, 1]
+    assert res.items[0].description == "canaleta 8x4"
+    assert res.items[1].description == "Breaker enchufable 2x40"
+
+
+def test_spaced_x_still_separates_quantity():
+    res = fallback_txt_lines_to_extraction("CANALETA 8X4 NEGRA x 20\n")
+
+    assert res.items[0].quantity == 20
+    assert res.items[0].description == "CANALETA 8X4 NEGRA"
