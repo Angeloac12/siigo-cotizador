@@ -519,20 +519,22 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
                     INSERT INTO draft_items
                     (id, draft_id, line_index, raw_text, description, quantity, uom, uom_raw, confidence, warnings_json)
                     VALUES
-                    (:id, :draft_id, :line_index, :raw_text, :description, :quantity, :uom, :uom_raw, :confidence, NULL)
+                    (:id, :draft_id, :line_index, :raw_text, :description, :quantity, :uom, :uom_raw, :confidence, CAST(:warnings_json AS jsonb))
                 """),
                 {
                     "id": str(uuid.uuid4()),
                     "draft_id": draft_id,
                     "line_index": int(it.line_index),
-                    # raw_text es NOT NULL en la base: el cliente no siempre lo envía,
-                    # así que caemos a la descripción editada (misma lógica que el commit).
+                    # Estas líneas ya pasaron por revisión manual, así que llenamos las
+                    # columnas que la base marca NOT NULL en vez de mandar NULL:
+                    # raw_text cae a la descripción editada y confidence queda en 1.0.
                     "raw_text": _sanitize_text(it.raw_text) or _sanitize_text(it.description),
                     "description": _sanitize_text(it.description),
                     "quantity": float(it.quantity),
                     "uom": it.uom,
                     "uom_raw": None,
-                    "confidence": float(it.confidence) if it.confidence is not None else None,
+                    "confidence": float(it.confidence) if it.confidence is not None else 1.0,
+                    "warnings_json": json.dumps([]),
                 },
             )
 
