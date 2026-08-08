@@ -525,8 +525,10 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
                     "id": str(uuid.uuid4()),
                     "draft_id": draft_id,
                     "line_index": int(it.line_index),
-                    "raw_text": it.raw_text,
-                    "description": it.description,
+                    # raw_text es NOT NULL en la base: el cliente no siempre lo envía,
+                    # así que caemos a la descripción editada (misma lógica que el commit).
+                    "raw_text": _sanitize_text(it.raw_text) or _sanitize_text(it.description),
+                    "description": _sanitize_text(it.description),
                     "quantity": float(it.quantity),
                     "uom": it.uom,
                     "uom_raw": None,
