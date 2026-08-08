@@ -17,7 +17,9 @@ class DocumentExtractor:
         self.max_items = int(os.getenv("OPENAI_MAX_ITEMS", "200"))
         self.max_file_mb = int(os.getenv("OPENAI_MAX_FILE_MB", "10"))
         self.pdf_max_pages = int(os.getenv("OPENAI_PDF_MAX_PAGES", "10"))
-        self.model = os.getenv("OPENAI_MODEL_EXTRACTOR", "gpt-4o-mini")
+        # Mismo default que OpenAIExtractor: este valor solo etiqueta meta.model,
+        # así que si difiere del real deja los drafts con un modelo que nunca corrió.
+        self.model = os.getenv("OPENAI_MODEL_EXTRACTOR", "gpt-4.1-mini")
 
     def _openai_enabled(self) -> bool:
         return os.getenv("OPENAI_ENABLED", "false").lower() == "true"
