@@ -60,6 +60,19 @@ _TRAILING_QTY_UOM_RE = re.compile(
     r"^(.*?)\s+(\d+(?:[.,]\d+)?)\s*([A-Za-zñÑ\.]+)\s*$"
 )
 
+# Trailing qty SIN unidad, solo tras un guion separador (e.g. "CANALETA 8X4 NEGRA — 20").
+# Exigimos el guion y una letra a la izquierda para no confundir calibres ni specs
+# que terminan en número ("CABLE THHN 12", "BREAKER 2X40").
+_TRAILING_BARE_QTY_RE = re.compile(
+    r"^(.*[A-Za-zñÑ].*?)\s*[-–—]\s*(\d{1,5}(?:[.,]\d{1,2})?)\s*$"
+)
+
+# Líneas de resumen: nunca deben aportar cantidad (el número es dinero).
+_TOTALS_RE = re.compile(
+    r"\b(totales?|subtotal|iva|retefuente|retencion|reteica|abono|saldo|descuento)\b",
+    flags=re.IGNORECASE,
+)
+
 
 def _to_float(s: str) -> Optional[float]:
     s = (s or "").strip()
@@ -202,6 +215,17 @@ def _extract_qty_uom_desc(raw: str):
             left = (m.group(1) or "").strip()
             qty2 = _to_float(m.group(2))
             if qty2 is not None and qty2 > 0:
+                qty = qty2
+                uom = Uom.UND
+                desc = left
+
+    # 2b) Cantidad al final, sin unidad, tras un guion ("CANALETA 8X4 NEGRA — 20")
+    if qty is None:
+        m = _TRAILING_BARE_QTY_RE.match(raw_clean)
+        if m:
+            left = (m.group(1) or "").strip()
+            qty2 = _to_float(m.group(2))
+            if qty2 is not None and qty2 > 0 and not _TOTALS_RE.search(left):
                 qty = qty2
                 uom = Uom.UND
                 desc = left

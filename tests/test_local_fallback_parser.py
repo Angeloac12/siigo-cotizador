@@ -38,3 +38,33 @@ def test_fallback_parses_all_lines():
     assert len(res.items) == 31
     assert res.items[0].quantity == 2
     assert res.items[0].description.lower().startswith("cinta autofundente")
+
+
+TRAILING_DASH_TXT = """CANALETA 8X4 NEGRA — 20
+TOMACORRIENTE DOBLE - 5
+BREAKER ENCHUFABLE 2X40 - 12
+"""
+
+
+def test_bare_trailing_qty_after_dash():
+    res = fallback_txt_lines_to_extraction(TRAILING_DASH_TXT)
+
+    assert [it.quantity for it in res.items] == [20, 5, 12]
+    assert res.items[0].description == "CANALETA 8X4 NEGRA"
+    assert res.items[2].description == "BREAKER ENCHUFABLE 2X40"
+    assert all(it.uom == "UND" for it in res.items)
+
+
+def test_specs_ending_in_number_are_not_quantities():
+    # Sin guion separador no inferimos cantidad: el número es calibre/spec.
+    res = fallback_txt_lines_to_extraction("CABLE THHN 12\nCABLE DESNUDO 4/0 AWG\n")
+
+    assert [it.quantity for it in res.items] == [1, 1]
+    assert "QTY_INFERRED" in (res.items[0].warnings or [])
+
+
+def test_totals_line_does_not_become_quantity():
+    res = fallback_txt_lines_to_extraction("Total a pagar - 584200\n")
+
+    assert res.items[0].quantity == 1
+    assert "QTY_INFERRED" in (res.items[0].warnings or [])
