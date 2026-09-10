@@ -494,6 +494,15 @@ class DraftItemsReplaceRequest(BaseModel):
 
 @app.put("/v1/drafts/{draft_id}/items")
 def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
+    if not payload.items:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "EMPTY_ITEMS",
+                "message": "El borrador debe contener al menos un ítem.",
+            },
+        )
+
     engine = get_engine()
 
     with engine.begin() as conn:
@@ -564,6 +573,62 @@ class QuoteCommitRequest(BaseModel):
     customer_create_payload: Optional[Dict[str, Any]] = None
 
 
+def _normalize_quote_commit_input(raw: Any) -> Dict[str, Any]:
+    """Accept the field names used by the UI and normalize them for the model."""
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_BODY",
+                "message": "El cuerpo debe ser un objeto JSON o un formulario.",
+            },
+        )
+
+    normalized = dict(raw)
+
+    def first_value(*keys: str):
+        for key in keys:
+            value = normalized.get(key)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
+        return None
+
+    customer = normalized.get("customer")
+    if isinstance(customer, dict):
+        customer_identification = customer.get("identification")
+        customer_branch_office = customer.get("branch_office")
+    else:
+        customer_identification = None
+        customer_branch_office = None
+
+    document = normalized.get("document")
+    document_id = document.get("id") if isinstance(document, dict) else None
+
+    if not normalized.get("customer_identification"):
+        value = first_value(
+            "client_document_number",
+            "customer_document_number",
+            "customer_identification_number",
+        ) or customer_identification
+        if value is not None:
+            normalized["customer_identification"] = value
+
+    if not normalized.get("branch_office") and customer_branch_office is not None:
+        normalized["branch_office"] = customer_branch_office
+
+    if not normalized.get("document_id"):
+        value = first_value("document_type_id", "quote_document_id") or document_id
+        if value is not None:
+            normalized["document_id"] = value
+
+    if not normalized.get("seller"):
+        value = first_value("seller_id")
+        if value is not None:
+            normalized["seller"] = value
+
+    return normalized
+
+
 # ✅✅✅ CAMBIO CLAVE: ahora acepta JSON o FORM
 @app.post("/v1/drafts/{draft_id}/quote/commit")
 async def commit_quote(draft_id: str, request: Request):
@@ -630,7 +695,15 @@ async def commit_quote(draft_id: str, request: Request):
             raw = dict(form)
 
     except Exception as e:
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=INVALID_BODY error=%s",
+            draft_id,
+            correlation_id,
+            str(e)[:200],
+        )
         raise HTTPException(status_code=400, detail={"code": "INVALID_BODY", "message": str(e)[:200]})
+
+    raw = _normalize_quote_commit_input(raw)
 
     try:
         body = QuoteCommitRequest.model_validate(raw)
@@ -641,6 +714,13 @@ async def commit_quote(draft_id: str, request: Request):
                 errs = e.errors()
             except Exception:
                 errs = None
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=COMMIT_VALIDATION_FAILED errors=%s received_keys=%s",
+            draft_id,
+            correlation_id,
+            errs or str(e)[:300],
+            list(raw.keys()),
+        )
         raise HTTPException(
             status_code=400,
             detail={"code": "COMMIT_VALIDATION_FAILED", "errors": errs or str(e)[:300], "received_keys": list(raw.keys())},
@@ -652,7 +732,7 @@ async def commit_quote(draft_id: str, request: Request):
     with engine.connect() as conn:
         draft = conn.execute(
             text("""
-                SELECT id, status, warnings_json
+                SELECT id, status, client_document_number, warnings_json
                 FROM drafts
                 WHERE id=:id
             """),
@@ -687,13 +767,27 @@ async def commit_quote(draft_id: str, request: Request):
                 """), {"draft_id": draft_id}).mappings().all()  
 
     if not rows:
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=DRAFT_HAS_NO_ITEMS",
+            draft_id,
+            correlation_id,
+        )
         raise HTTPException(status_code=400, detail="Draft has no items. Parse first or PUT items.")
 
     # -------------------------
     # 2) Completar defaults SI NO VINIERON del UI
     # -------------------------
-    customer_identification = (body.customer_identification or "").strip()
+    customer_identification = (
+        body.customer_identification
+        or draft.get("client_document_number")
+        or ""
+    ).strip()
     if not customer_identification:
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=MISSING_CUSTOMER_IDENTIFICATION",
+            draft_id,
+            correlation_id,
+        )
         raise HTTPException(status_code=400, detail={"code":"MISSING_CUSTOMER_IDENTIFICATION"})
 
     document_id = int(body.document_id or os.getenv("SIIGO_QUOTE_DOCUMENT_ID", "0") or "0")
@@ -708,6 +802,12 @@ async def commit_quote(draft_id: str, request: Request):
         missing.append("seller (or SIIGO_SELLER_ID)")
 
     if missing:
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=MISSING_REQUIRED_FIELDS missing=%s",
+            draft_id,
+            correlation_id,
+            ",".join(missing),
+        )
         raise HTTPException(
             status_code=400,
             detail={
@@ -804,6 +904,22 @@ async def commit_quote(draft_id: str, request: Request):
 
     if document_id <= 0:
         raise HTTPException(status_code=409, detail={"code": "MISSING_DOCUMENT_ID"})
+
+    if not body.dry_run and body.default_price <= 0:
+        log.warning(
+            "quote_commit_rejected draft_id=%s correlation_id=%s code=INVALID_ITEM_PRICE price=%s",
+            draft_id,
+            correlation_id,
+            body.default_price,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_ITEM_PRICE",
+                "message": "default_price debe ser mayor que cero para crear la cotización en Siigo.",
+                "default_price": body.default_price,
+            },
+        )
 
     quote_payload = {
         "document": {"id": int(document_id)},
@@ -914,6 +1030,13 @@ async def commit_quote(draft_id: str, request: Request):
 
  
     except HTTPException as e:
+        log.warning(
+            "quote_commit_upstream_rejected draft_id=%s correlation_id=%s status=%s detail=%s",
+            draft_id,
+            correlation_id,
+            e.status_code,
+            e.detail,
+        )
         if _is_duplicated_document_siigo(e):
             raise HTTPException(status_code=409, detail={"code": "SIIGO_DUPLICATED_DOCUMENT", **_normalize_detail(e)})
 
