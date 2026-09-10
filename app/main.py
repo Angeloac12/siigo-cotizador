@@ -848,6 +848,7 @@ async def commit_quote(draft_id: str, request: Request):
 
     ENABLE_AUTO_DESC = str(os.getenv("ENABLE_AUTO_DESC", "0")).lower() in ("1", "true", "yes", "on")
     AUTO_DESC_MIN_SIM = float(os.getenv("AUTO_DESC_MIN_SIM", "0.45"))
+    effective_default_price = float(body.default_price) if body.default_price > 0 else 1.0
 
     items: List[Dict[str, Any]] = []
 
@@ -880,7 +881,7 @@ async def commit_quote(draft_id: str, request: Request):
                 "code": code,
                 "description": desc,
                 "quantity": qty,
-                "price": float(body.default_price),
+                "price": effective_default_price,
             }
         )
 
@@ -898,24 +899,15 @@ async def commit_quote(draft_id: str, request: Request):
             "line_indexes": default_code_lines,
         })
 
+    if body.default_price <= 0:
+        commit_warnings.append({
+            "code": "DEFAULT_PRICE_USED",
+            "message": "Se usó precio unitario automático de 1.0 porque no se recibió un precio válido.",
+            "price": effective_default_price,
+        })
+
     if document_id <= 0:
         raise HTTPException(status_code=409, detail={"code": "MISSING_DOCUMENT_ID"})
-
-    if not body.dry_run and body.default_price <= 0:
-        log.warning(
-            "quote_commit_rejected draft_id=%s correlation_id=%s code=INVALID_ITEM_PRICE price=%s",
-            draft_id,
-            correlation_id,
-            body.default_price,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "INVALID_ITEM_PRICE",
-                "message": "default_price debe ser mayor que cero para crear la cotización en Siigo.",
-                "default_price": body.default_price,
-            },
-        )
 
     quote_payload = {
         "document": {"id": int(document_id)},
