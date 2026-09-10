@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import json
+import math
 import os
 import time, base64, json, threading
 import logging
@@ -851,13 +852,34 @@ async def commit_quote(draft_id: str, request: Request):
     effective_default_price = float(body.default_price) if body.default_price > 0 else 1.0
 
     items: List[Dict[str, Any]] = []
+    invalid_quantity_indexes: list[int] = []
+    rounded_quantity_indexes: list[int] = []
 
 
     
-    for r in rows:
+    for item_index, r in enumerate(rows):
         code = (str(r.get("item_code") or "").strip()) or "2543"
 
-        qty = float(r.get("quantity") or 0)
+        try:
+            qty = float(r.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 1.0
+            invalid_quantity_indexes.append(item_index)
+
+        if not math.isfinite(qty) or qty <= 0:
+            qty = 1.0
+            if item_index not in invalid_quantity_indexes:
+                invalid_quantity_indexes.append(item_index)
+        else:
+            rounded_qty = round(qty, 2)
+            if rounded_qty <= 0:
+                qty = 1.0
+                invalid_quantity_indexes.append(item_index)
+            else:
+                if rounded_qty != qty:
+                    rounded_quantity_indexes.append(item_index)
+                qty = rounded_qty
+
         uom = (r.get("uom") or "").strip()
 
         # 1) override manual siempre gana
@@ -904,6 +926,20 @@ async def commit_quote(draft_id: str, request: Request):
             "code": "DEFAULT_PRICE_USED",
             "message": "Se usó precio unitario automático de 1.0 porque no se recibió un precio válido.",
             "price": effective_default_price,
+        })
+
+    if invalid_quantity_indexes:
+        commit_warnings.append({
+            "code": "DEFAULT_QUANTITY_USED",
+            "message": "Se usó cantidad automática de 1.0 en los ítems con cantidad inválida.",
+            "item_indexes": invalid_quantity_indexes,
+        })
+
+    if rounded_quantity_indexes:
+        commit_warnings.append({
+            "code": "QUANTITY_ROUNDED",
+            "message": "Las cantidades se redondearon a máximo dos decimales para Siigo.",
+            "item_indexes": rounded_quantity_indexes,
         })
 
     if document_id <= 0:
