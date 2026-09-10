@@ -727,12 +727,12 @@ async def commit_quote(draft_id: str, request: Request):
         )
 
     # -------------------------
-    # 1) Leer draft + items (IMPORTANTE: traer client_document_number)
+    # 1) Leer draft + items. Keep this query compatible with the production schema.
     # -------------------------
     with engine.connect() as conn:
         draft = conn.execute(
             text("""
-                SELECT id, status, client_document_number, warnings_json
+                SELECT id, status, warnings_json
                 FROM drafts
                 WHERE id=:id
             """),
@@ -777,11 +777,7 @@ async def commit_quote(draft_id: str, request: Request):
     # -------------------------
     # 2) Completar defaults SI NO VINIERON del UI
     # -------------------------
-    customer_identification = (
-        body.customer_identification
-        or draft.get("client_document_number")
-        or ""
-    ).strip()
+    customer_identification = (body.customer_identification or "").strip()
     if not customer_identification:
         log.warning(
             "quote_commit_rejected draft_id=%s correlation_id=%s code=MISSING_CUSTOMER_IDENTIFICATION",
@@ -795,7 +791,7 @@ async def commit_quote(draft_id: str, request: Request):
 
     missing = []
     if not customer_identification:
-        missing.append("customer_identification (or drafts.client_document_number)")
+        missing.append("customer_identification")
     if not document_id:
         missing.append("document_id (or SIIGO_QUOTE_DOCUMENT_ID)")
     if not seller_id:
