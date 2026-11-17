@@ -218,7 +218,34 @@ class SiigoGateway:
         headers = self._headers()
 
         for attempt in range(2):
-            r = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+            try:
+                r = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+            except httpx.TimeoutException as exc:
+                # A missing response does not prove that Siigo rejected the POST.
+                # Do not retry: the quotation may already have been created.
+                logger.warning("siigo_quote_timeout error_type=%s", type(exc).__name__)
+                raise HTTPException(status_code=504, detail={
+                    "code": "SIIGO_QUOTE_TIMEOUT",
+                    "message": (
+                        "Se agotó el tiempo de espera de la respuesta de Siigo. "
+                        "No se pudo confirmar si la cotización fue creada. "
+                        "Revisa en Siigo antes de volver a enviarla para evitar duplicados."
+                    ),
+                    "outcome_unknown": True,
+                    "retryable": False,
+                }) from None
+            except httpx.RequestError as exc:
+                logger.warning("siigo_quote_unavailable error_type=%s", type(exc).__name__)
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_QUOTE_UNAVAILABLE",
+                    "message": (
+                        "No fue posible completar la comunicación con Siigo. "
+                        "No se pudo confirmar si la cotización fue creada. "
+                        "Revisa en Siigo antes de volver a enviarla para evitar duplicados."
+                    ),
+                    "outcome_unknown": True,
+                    "retryable": False,
+                }) from None
 
             if r.status_code == 429:
                 wait = 2
