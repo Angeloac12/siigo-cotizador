@@ -9,6 +9,7 @@ import logging
 from ulid import ULID
 from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 import uuid
 from pathlib import Path
 from sqlalchemy import text
@@ -27,6 +28,7 @@ from app.api.routes_matching import router as matching_router
 from app.db_engine import get_engine
 from app.api.routes_overrides import router as overrides_router
 from app.api.routes_rut import router as rut_router
+from app.services.quote_commit import ensure_quote_editable, quote_commit_attempt
 
 
 
@@ -240,7 +242,7 @@ def parse_draft(draft_id: str, request: Request):
 
     with engine.connect() as conn:
         draft = conn.execute(
-            text("SELECT id, status, stored_path, original_filename FROM drafts WHERE id = :id"),
+            text("SELECT id, status, stored_path, original_filename, warnings_json FROM drafts WHERE id = :id"),
             {"id": draft_id},
         ).mappings().first()
 
@@ -249,6 +251,8 @@ def parse_draft(draft_id: str, request: Request):
 
     if (draft.get("status") or "").upper() == "COMMITTED":
         raise HTTPException(status_code=409, detail="Draft is COMMITTED. Create a new draft to parse.")
+    # Parse must not erase a durable reservation after a timeout or restart.
+    ensure_quote_editable(draft)
 
     with engine.connect() as conn:
         cnt = conn.execute(
@@ -268,6 +272,12 @@ def parse_draft(draft_id: str, request: Request):
     result = extractor.extract(stored_path, original_filename, content_type=None)
 
     with engine.begin() as conn:
+        current = conn.execute(
+            text("SELECT status, warnings_json FROM drafts WHERE id = :id FOR UPDATE"), {"id": draft_id},
+        ).mappings().first()
+        ensure_quote_editable(current or {})
+        if current and current["status"] == "COMMITTED":
+            raise HTTPException(status_code=409, detail="Draft is COMMITTED. Create a new draft to parse.")
         conn.execute(text("DELETE FROM draft_items WHERE draft_id = :draft_id"), {"draft_id": draft_id})
 
         for it in result.items:
@@ -302,7 +312,7 @@ def parse_draft(draft_id: str, request: Request):
             text("""
                 UPDATE drafts
                 SET status = CASE WHEN status='COMMITTED' THEN 'COMMITTED' ELSE :status END,
-                    warnings_json = CAST(:warnings_json AS jsonb),
+                    warnings_json = COALESCE(warnings_json, '{}'::jsonb) || CAST(:warnings_json AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
             """),
@@ -508,7 +518,7 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
 
     with engine.begin() as conn:
         draft_row = conn.execute(
-            text("SELECT id, status, warnings_json FROM drafts WHERE id = :id"),
+            text("SELECT id, status, warnings_json FROM drafts WHERE id = :id FOR UPDATE"),
             {"id": draft_id},
         ).mappings().first()
 
@@ -516,6 +526,7 @@ def replace_draft_items(draft_id: str, payload: DraftItemsReplaceRequest):
             raise HTTPException(status_code=404, detail="Draft not found")
 
         w = draft_row.get("warnings_json") or {}
+        ensure_quote_editable(draft_row)
         has_quote = isinstance(w, dict) and w.get("siigo_quote_response")
 
         if draft_row.get("status") == "COMMITTED" or has_quote:
@@ -1042,95 +1053,101 @@ async def commit_quote(draft_id: str, request: Request):
     gw = get_gateway()
     customer_created: Optional[Dict[str, Any]] = None
 
-    try:
-        quote_resp = gw.create_quote(
-            customer_identification=str(customer_identification),
-            branch_office=int(body.branch_office),
-            document_id=int(document_id),
-            seller=int(seller_id),
-            items=items,
-            date_iso=str(date.today()),
-        )
-
- 
-    except HTTPException as e:
-        log.warning(
-            "quote_commit_upstream_rejected draft_id=%s correlation_id=%s status=%s detail=%s",
-            draft_id,
-            correlation_id,
-            e.status_code,
-            e.detail,
-        )
-        if _is_duplicated_document_siigo(e):
-            raise HTTPException(status_code=409, detail={"code": "SIIGO_DUPLICATED_DOCUMENT", **_normalize_detail(e)})
-
-        if not _is_customer_missing_siigo(e):
-            raise
-
-
-        # 3) Cliente no existe -> si no autorizaste autocreate, error controlado
-        if not body.create_customer_if_missing:
-            raise HTTPException(status_code=409, detail={"code": "CLIENT_NOT_FOUND"})
-
-        if not body.customer_create_payload:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]},
+    with quote_commit_attempt(engine, draft_id, correlation_id) as attempt_id:
+        try:
+            quote_resp = await run_in_threadpool(
+                gw.create_quote,
+                customer_identification=str(customer_identification),
+                branch_office=int(body.branch_office),
+                document_id=int(document_id),
+                seller=int(seller_id),
+                items=items,
+                date_iso=str(date.today()),
             )
 
-        missing_fields = _validate_customer_payload(body.customer_create_payload)
-        if missing_fields:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields},
+        except HTTPException as e:
+            log.warning(
+                "quote_commit_upstream_rejected draft_id=%s correlation_id=%s status=%s detail=%s",
+                draft_id,
+                correlation_id,
+                e.status_code,
+                e.detail,
+            )
+            if _is_duplicated_document_siigo(e):
+                raise HTTPException(status_code=409, detail={"code": "SIIGO_DUPLICATED_DOCUMENT", **_normalize_detail(e)})
+
+            if not _is_customer_missing_siigo(e):
+                raise
+
+
+            # 3) Cliente no existe -> si no autorizaste autocreate, error controlado
+            if not body.create_customer_if_missing:
+                raise HTTPException(status_code=409, detail={"code": "CLIENT_NOT_FOUND"})
+
+            if not body.customer_create_payload:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]},
+                )
+
+            missing_fields = _validate_customer_payload(body.customer_create_payload)
+            if missing_fields:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields},
+                )
+
+            log.info(
+                "customer_auto_create_attempt",
+                extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
+            )
+            customer_created = await run_in_threadpool(gw.create_client, body.customer_create_payload)
+            log.info(
+                "customer_auto_create_success",
+                extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
             )
 
-        log.info(
-            "customer_auto_create_attempt",
-            extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
-        )
-        customer_created = gw.create_client(body.customer_create_payload)
-        log.info(
-            "customer_auto_create_success",
-            extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
-        )
+            await run_in_threadpool(time.sleep, 1)
 
-        time.sleep(1)
+            quote_resp = await run_in_threadpool(
+                gw.create_quote,
+                customer_identification=str(customer_identification),
+                branch_office=int(body.branch_office),
+                document_id=int(document_id),
+                seller=int(seller_id),
+                items=items,
+                date_iso=str(date.today()),
+            )
 
-        quote_resp = gw.create_quote(
-            customer_identification=str(customer_identification),
-            branch_office=int(body.branch_office),
-            document_id=int(document_id),
-            seller=int(seller_id),
-            items=items,
-            date_iso=str(date.today()),
-        )
+        # -------------------------
+        # 7) Guardar resultado y marcar COMMITTED
+        # -------------------------
+        up_client_id = ""
+        if isinstance(customer_created, dict):
+            up_client_id = str(customer_created.get("id") or "")
+        if not up_client_id:
+            up_client_id = str((quote_resp.get("customer") or {}).get("id") or "")
 
-    # -------------------------
-    # 7) Guardar resultado y marcar COMMITTED
-    # -------------------------
-    up_client_id = ""
-    if isinstance(customer_created, dict):
-        up_client_id = str(customer_created.get("id") or "")
-    if not up_client_id:
-        up_client_id = str((quote_resp.get("customer") or {}).get("id") or "")
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                UPDATE drafts
-                SET status='COMMITTED',
-                    updated_at=now(),
-                    upstream_client_id = COALESCE(NULLIF(upstream_client_id, ''), :up_client_id),
-                    warnings_json = COALESCE(warnings_json, '{}'::jsonb) || CAST(:meta AS jsonb)
-                WHERE id=:id
-            """),
-            {
-                "id": draft_id,
-                "up_client_id": up_client_id,
-                "meta": json.dumps({"siigo_quote_response": quote_resp, "correlation_id": correlation_id}),
-            },
-        )
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE drafts
+                    SET status='COMMITTED',
+                        updated_at=now(),
+                        upstream_client_id = COALESCE(NULLIF(upstream_client_id, ''), :up_client_id),
+                        warnings_json = COALESCE(warnings_json, '{}'::jsonb) || CAST(:meta AS jsonb)
+                    WHERE id=:id
+                """),
+                {
+                    "id": draft_id,
+                    "up_client_id": up_client_id,
+                    "meta": json.dumps({
+                        "siigo_quote_response": quote_resp,
+                        "correlation_id": correlation_id,
+                        "quote_commit": {"state": "SUCCEEDED", "attempt_id": attempt_id},
+                    }),
+                },
+            )
 
     return {
         "draft_id": draft_id,

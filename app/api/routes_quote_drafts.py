@@ -6,6 +6,7 @@ import logging
 import os
 
 from app.services.local_fallback_parser import fallback_enabled, fallback_txt_lines_to_extraction
+from app.services.siigo_timeouts import quote_proxy_timeout
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -17,6 +18,8 @@ ERROR_MESSAGES = {
 
 
 def _timeout_for_path(path: str) -> httpx.Timeout:
+    if path.endswith("/quote/commit"):
+        return quote_proxy_timeout()
     # Ajusta según tu realidad:
     # - upload: rápido
     # - parse: puede tardar ~90s+ cuando OpenAI se pone lento
@@ -62,6 +65,13 @@ async def _proxy(
                 json=json,
             )
         except httpx.TimeoutException:
+            if path.endswith("/quote/commit"):
+                raise HTTPException(status_code=504, detail={
+                    "code": "SIIGO_QUOTE_TIMEOUT",
+                    "message": "El envío sigue sin confirmarse. Consulta el borrador y revisa en Siigo antes de reenviarlo.",
+                    "outcome_unknown": True,
+                    "retryable": False,
+                }) from None
             raise HTTPException(
                 status_code=504,
                 detail={
@@ -74,6 +84,13 @@ async def _proxy(
                 },
             )
         except httpx.RequestError as e:
+            if path.endswith("/quote/commit"):
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_QUOTE_UNAVAILABLE",
+                    "message": "Se interrumpió la comunicación con el envío. Consulta el borrador antes de repetirlo.",
+                    "outcome_unknown": True,
+                    "retryable": False,
+                }) from None
             raise HTTPException(
                 status_code=502,
                 detail={

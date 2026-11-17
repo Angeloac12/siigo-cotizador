@@ -39,6 +39,7 @@ Servicio → **Environment** → **Edit**.
 | `SIIGO_API_USER` | Usuario de las credenciales API de Siigo; valor privado |
 | `SIIGO_ACCESS_KEY` | Clave API de Siigo; valor privado |
 | `SIIGO_PARTNER_ID` | Identificador real de la integración, de 3 a 100 caracteres alfanuméricos |
+| `SIIGO_QUOTE_READ_TIMEOUT_SECONDS` | Opcional: espera de lectura al crear cotizaciones; por defecto `120` segundos. Admite de 30 a 300; un valor inválido usa 120. |
 
 Guardar y desplegar con la opción disponible en Render. Esperar a **Live** en
 **Events**. Un cambio de variables no cambia el commit de GitHub. El gateway
@@ -93,13 +94,55 @@ error de red no se capturaba. Los commits de 162 y 180 ms, dentro del flujo
 de Siigo y no demuestran creación real. `/match` tardó 13,867 y 47,180 s en
 las dos ejecuciones mostradas.
 
-Corrección local preparada (pendiente de despliegue): los timeouts de creación
+Primera corrección publicada en `c07897c`: los timeouts de creación
 devuelven 504 con `SIIGO_QUOTE_TIMEOUT`; otros errores de transporte devuelven
 502 con `SIIGO_QUOTE_UNAVAILABLE`. Ambos incluyen `outcome_unknown=true` y
 `retryable=false`: son una indicación conservadora de que se debe comprobar el
 resultado en Siigo antes de repetir el envío. No se reintenta automáticamente
 un POST tras un error de transporte. Esto controla el error; no resuelve la
 demora del proveedor ni bloquea un nuevo envío manual desde el frontend.
+El log aportado de las 17:11:12 UTC confirma que este manejo ya estaba activo:
+devolvió `SIIGO_QUOTE_TIMEOUT` y 504 después de 31,841 s.
+
+Refuerzo posterior preparado tras ese log:
+
+- La espera de lectura pasa de 30 a **120 segundos** por defecto, de acuerdo
+  con la [recomendación oficial de Siigo](https://developers.siigo.com/docs/siigoapi/manejo-de-errores/).
+  La conexión mantiene un límite de 10 s; la escritura, de 30 s. El proxy
+  interno deja margen adicional para autenticación y creación de cliente.
+- La llamada síncrona a Siigo se ejecuta en un hilo de trabajo: no bloquea el
+  bucle de eventos de FastAPI durante toda la espera.
+- Antes de enviar, se reserva el borrador mediante una actualización atómica
+  en PostgreSQL. La reserva se guarda en `warnings_json.quote_commit`; no
+  requiere migraciones ni cambios de variables en Render.
+- `IN_PROGRESS` bloquea otro envío mientras se procesa el primero. `UNKNOWN`
+  bloquea el reenvío y la edición cuando no se pudo confirmar el resultado.
+  La protección persiste entre procesos y reinicios. No caduca automáticamente.
+- Un rechazo confirmado deja `FAILED` y permite corregir y volver a enviar;
+  un resultado válido con identificador se guarda como `SUCCEEDED` y
+  `COMMITTED`. Las repeticiones posteriores recuperan el resultado guardado.
+- Una respuesta inválida o un fallo al guardar el resultado después del POST
+  no libera el borrador para un nuevo envío.
+
+Si aparece `SIIGO_QUOTE_REVIEW_REQUIRED` o una reserva queda en `IN_PROGRESS`
+tras un reinicio, revisar en Siigo y resolver mediante una conexión operativa
+autorizada a la base. Si existe el documento, guardar la respuesta verificada
+en `siigo_quote_response` y marcar `COMMITTED`/`SUCCEEDED`. Solo si se confirma
+que no se creó, cambiar la reserva a `FAILED`, conservando la evidencia de la
+revisión. El frontend no puede saltarse el bloqueo modificando los ítems.
+No hay liberación automática: la ausencia de respuesta no confirma ausencia
+del documento.
+
+Los timeouts anteriores a este refuerzo no tienen reserva persistida; en
+particular, revisar el borrador `1b2bc4df-5ff8-4ad6-9f3e-37f0cc795e90` antes
+de repetirlo. No se han conciliado ni modificado los datos de producción.
+La protección es por borrador; no deduplica borradores distintos con el mismo
+contenido. Una caída de Siigo puede seguir superando los 120 s.
+
+La [documentación de idempotencia de Siigo](https://developers.siigo.com/docs/siigoapi/idempotencia)
+enumera facturas, notas crédito, comprobantes contables y recibos de caja;
+no confirma ese soporte para cotizaciones. Por eso no se usan reintentos de
+POST tras un resultado incierto basados únicamente en ese encabezado.
 
 Antes de repetir la cotización fallida, revisar en Siigo las cotizaciones del
 cliente y la fecha correspondiente. Un timeout puede ocurrir después de que
@@ -134,6 +177,8 @@ de consulta de clientes actualmente captura cualquier excepción y devuelve
 | `SIIGO_AUTH_TIMEOUT` / `SIIGO_AUTH_UNAVAILABLE` | Conectividad con Siigo |
 | `SIIGO_AUTH_INVALID_RESPONSE` | Respuesta sin token válido, JSON inválido o expiración inválida |
 | `SIIGO_QUOTE_TIMEOUT` / `SIIGO_QUOTE_UNAVAILABLE` | Resultado de creación sin confirmar; comprobar en Siigo antes de repetir el envío |
+| `SIIGO_QUOTE_IN_PROGRESS` / `SIIGO_QUOTE_REVIEW_REQUIRED` | El borrador ya tiene un envío en curso o sin confirmar; no repetirlo ni crear otro para eludir el bloqueo |
+| `SIIGO_QUOTE_INVALID_RESPONSE` | Siigo no devolvió un identificador válido; revisar el documento antes de repetir |
 | 200 en previsualización | Payload preparado; todavía no se autenticó ni creó una cotización |
 
 El gateway registra estado y formato de respuesta, sin cuerpo de autenticación,
@@ -157,6 +202,17 @@ Pydantic 2.12.5. Todas las llamadas a Siigo de esas pruebas fueron simuladas.
 Validación adicional del manejo de errores de creación: **52 pruebas pasaron**,
 incluidas 8 nuevas pruebas de transporte, ausencia de reintentos tras timeout,
 renovación de token y respuesta exitosa. No se crearon cotizaciones reales.
+
+Las pruebas de persistencia y concurrencia usan PostgreSQL y llamadas simuladas
+a Siigo. Ejecutarlas contra una instancia local aislada con
+`SIIGO_TEST_DATABASE_URL` definido; cada prueba crea y elimina su propio esquema.
+Si no se define esa variable, esas pruebas se omiten.
+
+Validación del refuerzo: **79 pruebas pasaron**, incluidas 10 con PostgreSQL
+real aislado. Se verificaron dos reservas simultáneas, respuesta de `/health`
+durante una llamada lenta, bloqueo tras timeout o reinicio, fallo de persistencia
+tras una creación y timeout en el segundo envío después de crear el cliente.
+Todas las llamadas a Siigo fueron simuladas.
 
 - [Autenticación oficial](https://developers.siigo.com/docs/siigoapi/autenticacion/autenticacion/)
 - [Partner-Id](https://developers.siigo.com/docs/siigoapi/partner-id/)

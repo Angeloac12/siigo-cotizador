@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, List
 import httpx
 from fastapi import HTTPException
 
+from app.services.siigo_timeouts import quote_timeout
+
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +221,7 @@ class SiigoGateway:
 
         for attempt in range(2):
             try:
-                r = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+                r = httpx.post(url, headers=headers, json=payload, timeout=quote_timeout())
             except httpx.TimeoutException as exc:
                 # A missing response does not prove that Siigo rejected the POST.
                 # Do not retry: the quotation may already have been created.
@@ -248,12 +250,13 @@ class SiigoGateway:
                 }) from None
 
             if r.status_code == 429:
-                wait = 2
-                ra = r.headers.get("Retry-After")
-                if ra and ra.isdigit():
-                    wait = int(ra)
-                time.sleep(wait)
-                continue
+                raise HTTPException(status_code=503, detail={
+                    "code": "SIIGO_QUOTE_RATE_LIMITED",
+                    "message": "Siigo limitó temporalmente los envíos. Intenta de nuevo más tarde.",
+                    "upstream_status": 429,
+                    "outcome_unknown": False,
+                    "retryable": True,
+                })
 
             if r.status_code == 401 and attempt == 0:
                 self._invalidate_token()
@@ -272,9 +275,22 @@ class SiigoGateway:
                         "url": url,
                         "siigoapi_error_code": r.headers.get("siigoapi-error-code"),
                         "response": body,
+                        "outcome_unknown": r.status_code >= 500,
                     },
                 )
 
-            return r.json()
-
-        raise HTTPException(status_code=502, detail="Siigo create quotation failed after retries")
+            try:
+                result = r.json()
+                if not isinstance(result, dict) or not isinstance(result.get("id"), str) or not result["id"].strip():
+                    raise ValueError("Missing quotation identifier")
+                if not r.is_success:
+                    raise ValueError("Unexpected quotation status")
+            except (ValueError, TypeError):
+                logger.warning("siigo_quote_invalid_response upstream_status=%s", r.status_code)
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_QUOTE_INVALID_RESPONSE",
+                    "message": "Siigo devolvió una respuesta sin confirmar la cotización. Revisa en Siigo antes de reenviarla.",
+                    "outcome_unknown": True,
+                    "retryable": False,
+                }) from None
+            return result
