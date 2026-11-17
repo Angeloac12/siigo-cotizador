@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import threading
 import time
@@ -9,6 +10,9 @@ from typing import Any, Dict, Optional, List
 
 import httpx
 from fastapi import HTTPException
+
+
+logger = logging.getLogger(__name__)
 
 
 def _jwt_exp(token: str) -> int:
@@ -47,6 +51,8 @@ class SiigoGateway:
             raise HTTPException(status_code=500, detail="Missing SIIGO_API_USER / SIIGO_ACCESS_KEY env vars.")
         if not self.signin_url:
             raise HTTPException(status_code=500, detail="Missing SIIGO_SIGNIN_URL env var.")
+        if not self.partner_id:
+            raise HTTPException(status_code=500, detail="Missing SIIGO_PARTNER_ID env var.")
 
         now = int(time.time())
 
@@ -54,27 +60,72 @@ class SiigoGateway:
             if self._token and now < (self._token_exp - 30):
                 return self._token
 
-            r = httpx.post(
-                self.signin_url,
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-                json={"userName": self.api_user, "access_key": self.access_key},
-                timeout=20.0,
-            )
+            try:
+                r = httpx.post(
+                    self.signin_url,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "Partner-Id": self.partner_id,
+                    },
+                    json={"username": self.api_user, "access_key": self.access_key},
+                    timeout=20.0,
+                )
+            except httpx.TimeoutException:
+                logger.warning("siigo_auth_timeout")
+                raise HTTPException(status_code=504, detail={
+                    "code": "SIIGO_AUTH_TIMEOUT",
+                    "message": "Siigo tardó demasiado en responder a la autenticación. Intenta de nuevo.",
+                }) from None
+            except httpx.RequestError:
+                logger.warning("siigo_auth_unavailable")
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_AUTH_UNAVAILABLE",
+                    "message": "No fue posible conectar con Siigo para autenticar. Intenta de nuevo.",
+                }) from None
+
+            if not r.is_success:
+                # Do not log the response body: providers can echo credentials or tokens.
+                logger.warning(
+                    "siigo_auth_rejected upstream_status=%s response_format=%s",
+                    r.status_code,
+                    "json" if "json" in r.headers.get("content-type", "").lower() else "non_json",
+                )
 
             if r.status_code == 429:
-                raise HTTPException(status_code=503, detail="Siigo rate limit (429) on auth. Retry in a moment.")
+                raise HTTPException(status_code=503, detail={
+                    "code": "SIIGO_AUTH_RATE_LIMITED",
+                    "message": "Siigo limitó temporalmente la autenticación. Intenta de nuevo más tarde.",
+                    "upstream_status": 429,
+                })
 
-            r.raise_for_status()
-            data = r.json()
+            if not r.is_success:
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_AUTH_FAILED",
+                    "message": "Siigo rechazó la autenticación. Revisa las credenciales y permisos de la integración.",
+                    "upstream_status": r.status_code,
+                })
 
-            token = data.get("access_token") or data.get("token") or data.get("accessToken")
-            if not token:
-                raise HTTPException(status_code=500, detail=f"Auth ok but token missing. Keys: {list(data.keys())}")
+            try:
+                data = r.json()
+                if not isinstance(data, dict):
+                    raise ValueError("Expected an authentication object")
+                token = data.get("access_token") or data.get("token") or data.get("accessToken")
+                if not isinstance(token, str) or not token.strip():
+                    raise ValueError("Missing authentication token")
 
-            exp = _jwt_exp(token)
-            if not exp:
-                expires_in = int(data.get("expires_in") or data.get("expiresIn") or 3600)
-                exp = now + expires_in
+                exp = _jwt_exp(token)
+                if not exp:
+                    expires_in = int(data.get("expires_in") or data.get("expiresIn") or 3600)
+                    if expires_in <= 0:
+                        raise ValueError("Invalid token lifetime")
+                    exp = now + expires_in
+            except (ValueError, TypeError, OverflowError):
+                logger.warning("siigo_auth_invalid_response upstream_status=%s", r.status_code)
+                raise HTTPException(status_code=502, detail={
+                    "code": "SIIGO_AUTH_INVALID_RESPONSE",
+                    "message": "Siigo devolvió una respuesta de autenticación inválida.",
+                }) from None
 
             self._token = token
             self._token_exp = exp
