@@ -4,15 +4,32 @@
 
 ## Referencia rápida
 
+**Estado al cierre del 2026-11-17: el usuario confirmó que ya funcionó**, después
+de publicar el refuerzo
+[`cf634e4`](https://github.com/Angeloac12/siigo-cotizador/commit/cf634e4a023c15dac3621a514cc98f55c93c46a3)
+y solicitar su despliegue en Render. Dar el incidente por resuelto según esa
+confirmación. No volver a repetir envíos reales solo para verificar el cierre.
+No se aportaron el identificador de la cotización final, un log final de éxito
+ni una captura de Events/Live; la confirmación es del usuario, no una
+verificación independiente del agente.
+
 La autenticación operativa usa `https://api.siigo.com/auth`, con JSON
 `{"username": "<usuario API>", "access_key": "<clave API>"}` y encabezado
 `Partner-Id`. Las operaciones usan `https://api.siigo.com/v1`.
 
 El 2026-11-17 se corrigió el gateway en el commit
 [`902f016`](https://github.com/Angeloac12/siigo-cotizador/commit/902f016d9a64233f9ddb0d260f701a4b36817785).
-Después se actualizaron las URLs en Render. El usuario reportó que quedó hecho
-tras la prueba en producción. No se adjuntó a esta sesión el identificador de la
-cotización final ni un log final de éxito; no asumir una verificación independiente.
+Después se actualizaron las URLs en Render. Los fallos posteriores de timeout
+se corrigieron en dos pasos:
+
+| Commit | Cambio |
+| --- | --- |
+| `902f016` | Autenticación corregida y errores de autenticación controlados |
+| `c07897c` | Timeout de creación controlado como 504, con resultado sin confirmar |
+| `cf634e4` | Espera de lectura de 120 s, llamadas en hilo de trabajo y reserva persistente por borrador |
+
+El estado de funcionamiento confirmado corresponde al último refuerzo; el 504
+de los logs intermedios no confirmaba por sí solo una creación exitosa.
 
 ## Dónde está cada parte
 
@@ -104,7 +121,8 @@ demora del proveedor ni bloquea un nuevo envío manual desde el frontend.
 El log aportado de las 17:11:12 UTC confirma que este manejo ya estaba activo:
 devolvió `SIIGO_QUOTE_TIMEOUT` y 504 después de 31,841 s.
 
-Refuerzo posterior preparado tras ese log:
+Refuerzo posterior publicado en `cf634e4`, tras ese log, y funcionamiento
+confirmado por el usuario al cierre:
 
 - La espera de lectura pasa de 30 a **120 segundos** por defecto, de acuerdo
   con la [recomendación oficial de Siigo](https://developers.siigo.com/docs/siigoapi/manejo-de-errores/).
@@ -156,12 +174,22 @@ apagados ordenados, pero no su causa.
 En este incidente, el plan gratuito de Render no incluía Shell. Usar la app:
 
 1. Confirmar el despliegue **Live** y las URLs de Environment.
-2. Retomar la cotización autorizada que falló y revisar cliente, productos y cantidades.
-3. Pulsar **Crear cotización en Siigo** una vez; este paso crea el documento real.
-4. Comprobar el número o identificador devuelto y el registro real en Siigo,
+2. Revisar si el intento previo ya creó un documento en Siigo. Si el borrador
+   está en `UNKNOWN` o quedó en `IN_PROGRESS` tras un reinicio, resolver la
+   revisión operativa descrita arriba antes de otro envío.
+3. Solo para una nueva prueba real autorizada, revisar cliente, productos y cantidades.
+4. Pulsar **Crear cotización en Siigo** una vez; este paso crea el documento real.
+5. Comprobar el número o identificador devuelto y el registro real en Siigo,
    además del estado HTTP del envío.
-5. Si falla, conservar hora, `correlation_id`, `draft_id`, código de error y
+6. Si falla, conservar hora, `correlation_id`, `draft_id`, código de error y
    `upstream_status`. Revisar primero el diagnóstico siguiente.
+
+Este procedimiento queda para incidencias o verificaciones futuras. Al cierre
+no se ejecutó otra creación: el usuario ya había confirmado el funcionamiento.
+
+La lentitud variable de `/match` queda como mejora separada, no como un fallo
+pendiente de autenticación o creación. No se concilió desde esta sesión la
+posible existencia de documentos de los intentos anteriores con timeout.
 
 Ni `/health` ni un commit en modo prueba prueban la autenticación. El endpoint
 de consulta de clientes actualmente captura cualquier excepción y devuelve
