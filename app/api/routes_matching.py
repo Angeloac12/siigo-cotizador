@@ -1,3 +1,4 @@
+from app.services.quote_commit import lock_quote_editable
 import os
 import re
 import json
@@ -451,6 +452,8 @@ def match_draft_items(draft_id: str, payload: dict = Body(...)):
     ]
 
     with eng.begin() as conn:
+        if apply:
+            lock_quote_editable(conn, draft_id)
         batch_rows = conn.execute(
             text(_SQL_BATCH_LATERAL),
             {
@@ -630,6 +633,7 @@ def select_item_for_draft_line(
     eng = get_engine()
 
     with eng.begin() as conn:
+        lock_quote_editable(conn, draft_id)
         # 1) validar item existe
         row = conn.execute(
             text("""

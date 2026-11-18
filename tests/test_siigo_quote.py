@@ -99,6 +99,63 @@ def test_quote_success_is_returned(quote_endpoint, monkeypatch):
     assert response.json() == result
 
 
+def test_provider_504_is_pending_without_retry_or_exposing_raw_error(quote_endpoint, monkeypatch):
+    _, app = quote_endpoint
+    calls = []
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(504, headers={"siigoapi-error-code": "timed_out"}, json={
+            "Status": 504, "Errors": [{"Code": "timed_out", "Message": "Request timed out."}],
+        })
+    with httpx.Client(transport=httpx.MockTransport(respond)) as upstream:
+        monkeypatch.setattr("app.upstream_gateway.siigo.httpx.post", upstream.post)
+        with TestClient(app) as client:
+            response = client.post("/commit")
+    detail = response.json()["detail"]
+    assert response.status_code == 504
+    assert detail["code"] == "SIIGO_QUOTE_TIMEOUT"
+    assert detail["upstream_status"] == 504
+    assert detail["outcome_unknown"] and not detail["retryable"]
+    assert "Verificar en Siigo" in detail["message"]
+    assert len(calls) == 1
+
+
+def test_quote_listing_uses_bounded_read_and_filters(quote_endpoint, monkeypatch):
+    gateway, _ = quote_endpoint
+    def respond(request):
+        assert request.method == "GET"
+        assert request.url.params["customer_identification"] == "123"
+        assert request.url.params["page"] == "2"
+        assert request.extensions["timeout"]["read"] == 20
+        return httpx.Response(200, json={"results": []})
+    with httpx.Client(transport=httpx.MockTransport(respond)) as upstream:
+        monkeypatch.setattr("app.upstream_gateway.siigo.httpx.get", upstream.get)
+        assert gateway.list_quotes(identification="123", branch_office=0,
+            created_start="2026-11-17", created_end="2026-11-17", page=2) == {"results": []}
+
+
+@pytest.mark.parametrize("body", [b"html", b"{}", b'{"results":null}', b'{"results":[1]}'])
+def test_invalid_lookup_is_not_an_empty_success(quote_endpoint, monkeypatch, body):
+    gateway, _ = quote_endpoint
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body))) as upstream:
+        monkeypatch.setattr("app.upstream_gateway.siigo.httpx.get", upstream.get)
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            gateway.list_quotes(identification="123", branch_office=0,
+                created_start="2026-11-17", created_end="2026-11-17")
+    assert exc.value.status_code == 502
+
+
+@pytest.mark.parametrize("quotation_id", ["../customers", "abc?token=secret", "", "https://example.com"])
+def test_quote_detail_rejects_non_uuid_without_network(quote_endpoint, monkeypatch, quotation_id):
+    gateway, _ = quote_endpoint
+    monkeypatch.setattr("app.upstream_gateway.siigo.httpx.get", lambda *a, **kw: pytest.fail("Unexpected network call"))
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        gateway.get_quote(quotation_id)
+    assert exc.value.status_code == 422
+
+
 @pytest.mark.parametrize("setting,expected", [
     ("120", 120), ("180", 180), ("30", 30), ("300", 300),
     ("0", 120), ("nan", 120), ("inf", 120), ("bad", 120), ("301", 120),

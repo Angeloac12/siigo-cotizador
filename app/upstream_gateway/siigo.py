@@ -220,6 +220,7 @@ class SiigoGateway:
         headers = self._headers()
 
         for attempt in range(2):
+            started = time.monotonic()
             try:
                 r = httpx.post(url, headers=headers, json=payload, timeout=quote_timeout())
             except httpx.TimeoutException as exc:
@@ -249,6 +250,10 @@ class SiigoGateway:
                     "retryable": False,
                 }) from None
 
+            logger.info(
+                "siigo_quote_response upstream_status=%s duration_ms=%s item_count=%s",
+                r.status_code, int((time.monotonic() - started) * 1000), len(items),
+            )
             if r.status_code == 429:
                 raise HTTPException(status_code=503, detail={
                     "code": "SIIGO_QUOTE_RATE_LIMITED",
@@ -268,6 +273,18 @@ class SiigoGateway:
                     body = r.json()
                 except Exception:
                     body = r.text
+                if r.status_code >= 500:
+                    is_timeout = r.status_code == 504 or r.headers.get("siigoapi-error-code") == "timed_out"
+                    raise HTTPException(status_code=r.status_code, detail={
+                        "code": "SIIGO_QUOTE_TIMEOUT" if is_timeout else "SIIGO_QUOTE_UNAVAILABLE",
+                        "message": (
+                            "Siigo no confirmó la creación de la cotización. "
+                            "Usa Verificar en Siigo antes de volver a enviarla para evitar duplicados."
+                        ),
+                        "upstream_status": r.status_code,
+                        "siigoapi_error_code": r.headers.get("siigoapi-error-code"),
+                        "outcome_unknown": True, "retryable": False,
+                    })
                 raise HTTPException(
                     status_code=r.status_code,
                     detail={
@@ -294,3 +311,64 @@ class SiigoGateway:
                     "retryable": False,
                 }) from None
             return result
+
+    def _quote_get(self, path: str, params: dict | None = None) -> dict:
+        """Bounded reads; never follow URLs supplied by the provider or caller."""
+        headers = self._headers()
+        for attempt in range(2):
+            try:
+                response = httpx.get(f"{self.base_url}/quotations{path}", headers=headers,
+                                     params=params, timeout=httpx.Timeout(20, connect=10))
+            except httpx.RequestError:
+                raise HTTPException(502, detail={
+                    "code": "SIIGO_QUOTE_LOOKUP_UNAVAILABLE",
+                    "message": "No se pudo consultar Siigo. El envío permanece pendiente de confirmación.",
+                    "outcome_unknown": True, "retryable": False,
+                }) from None
+            if response.status_code == 401 and attempt == 0:
+                self._invalidate_token()
+                headers = self._headers()
+                continue
+            if not response.is_success:
+                raise HTTPException(502, detail={
+                    "code": "SIIGO_QUOTE_LOOKUP_UNAVAILABLE", "upstream_status": response.status_code,
+                    "message": "Siigo no permitió verificar la cotización. El envío sigue pendiente.",
+                    "outcome_unknown": True, "retryable": False,
+                })
+            try:
+                result = response.json()
+                if not isinstance(result, dict):
+                    raise ValueError()
+                return result
+            except (ValueError, TypeError):
+                raise HTTPException(502, detail={
+                    "code": "SIIGO_QUOTE_LOOKUP_INVALID_RESPONSE",
+                    "message": "Siigo devolvió una consulta inválida. El envío sigue pendiente.",
+                    "outcome_unknown": True, "retryable": False,
+                }) from None
+
+    def list_quotes(self, *, identification: str, branch_office: int,
+                    created_start: str, created_end: str, page: int = 1) -> dict:
+        result = self._quote_get("", {
+            "customer_identification": identification, "customer_branch_office": branch_office,
+            "created_start": created_start, "created_end": created_end,
+            "page": page, "page_size": 25,
+        })
+        if not isinstance(result.get("results"), list) or not all(isinstance(q, dict) for q in result["results"]):
+            raise HTTPException(502, detail={"code": "SIIGO_QUOTE_LOOKUP_INVALID_RESPONSE",
+                "message": "Siigo devolvió un listado inválido. El envío sigue pendiente.",
+                "outcome_unknown": True, "retryable": False})
+        return result
+
+    def get_quote(self, quotation_id: str) -> dict:
+        # Siigo documents UUIDs. Validate before building a path (no query/path injection).
+        from uuid import UUID
+        try:
+            safe_id = str(UUID(quotation_id))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(422, detail={"code": "INVALID_QUOTATION_ID"}) from None
+        result = self._quote_get(f"/{safe_id}")
+        if result.get("id") != safe_id:
+            raise HTTPException(502, detail={"code": "SIIGO_QUOTE_LOOKUP_INVALID_RESPONSE",
+                "message": "Siigo no devolvió el documento solicitado.", "outcome_unknown": True, "retryable": False})
+        return result
