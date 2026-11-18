@@ -1,3 +1,4 @@
+from app.services.quote_commit import lock_quote_editable
 from fastapi import APIRouter, HTTPException, Body
 from sqlalchemy import text
 from app.db_engine import get_engine
@@ -12,6 +13,7 @@ def set_description_override(draft_id: str, line_index: int, payload: dict = Bod
 
     eng = get_engine()
     with eng.begin() as conn:
+        lock_quote_editable(conn, draft_id)
         # upsert override
         conn.execute(text("""
             INSERT INTO draft_item_selections (draft_id, line_index, provider, chosen_by, description_override)

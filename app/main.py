@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import json
 import math
 import os
@@ -28,7 +30,7 @@ from app.api.routes_matching import router as matching_router
 from app.db_engine import get_engine
 from app.api.routes_overrides import router as overrides_router
 from app.api.routes_rut import router as rut_router
-from app.services.quote_commit import ensure_quote_editable, quote_commit_attempt
+from app.services.quote_commit import ensure_quote_editable, quote_submission_status
 
 
 
@@ -58,7 +60,24 @@ if not DATABASE_URL:
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-app = FastAPI(title="SiigoCotizador", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app):
+    from app.services.quote_queue import quote_worker
+    stop = asyncio.Event()
+    worker = None
+    if os.getenv("SIIGO_QUOTE_WORKER_ENABLED", "true").lower() in ("true", "1", "yes"):
+        worker = asyncio.create_task(quote_worker(get_engine, get_gateway, stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        if worker:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+
+
+app = FastAPI(title="SiigoCotizador", version="0.1.0", lifespan=lifespan)
 ##app.include_router(siigo_catalog_router)
 app.include_router(quote_drafts_router)
 app.include_router(catalog_router)
@@ -84,6 +103,7 @@ def error_json(code: str, message: str, corr_id: str, details: dict | None = Non
 async def base_middleware(request: Request, call_next):
     start = time.time()
     corr_id = request.headers.get("X-Correlation-Id") or new_correlation_id()
+    request.state.correlation_id = corr_id
 
     # Auth: proteger /v1/* (excepto /health que va libre)
     if request.url.path.startswith("/v1/"):
@@ -358,7 +378,41 @@ def get_draft(draft_id: str, request: Request):
             {"id": draft_id},
         ).mappings().all()
 
-    return {"draft": dict(draft), "items": [dict(x) for x in items]}
+    from app.services.quote_commit import quote_submission_status
+    return {"draft": dict(draft), "items": [dict(x) for x in items],
+            "submission": quote_submission_status(draft)}
+
+
+@app.get("/v1/drafts/{draft_id}/quote/submission")
+def get_quote_submission(draft_id: str):
+    from app.services.quote_commit import quote_submission_status
+    from app.services.quote_review import load_draft
+    return {"draft_id": draft_id, "submission": quote_submission_status(load_draft(get_engine(), draft_id))}
+
+
+from fastapi import Query
+from typing import Literal
+from uuid import UUID
+
+
+class QuoteConfirmation(BaseModel):
+    attempt_id: str = Field(min_length=1, max_length=64)
+    quotation_id: UUID
+    confirmed: Literal[True]
+
+
+@app.post("/v1/drafts/{draft_id}/quote/verify")
+def verify_quote_submission(draft_id: str, page: int = Query(1, ge=1, le=1000)):
+    from app.services.quote_review import verify_quote
+    return verify_quote(get_engine(), get_gateway(), draft_id, page)
+
+
+@app.post("/v1/drafts/{draft_id}/quote/confirm")
+def confirm_quote_submission(draft_id: str, body: QuoteConfirmation, request: Request):
+    from app.services.quote_review import confirm_quote
+    correlation_id = request.headers.get("X-Correlation-Id") or getattr(request.state, "correlation_id", None) or new_correlation_id()
+    return confirm_quote(get_engine(), get_gateway(), draft_id, body.attempt_id,
+                         str(body.quotation_id), correlation_id)
 
 
 # --- DB engine helper (needed by /parse) ---
@@ -581,6 +635,7 @@ class QuoteCommitRequest(BaseModel):
     default_price: float = 0
 
     dry_run: bool = True
+    enqueue: bool = False
     create_customer_if_missing: bool = False
     customer_create_payload: Optional[Dict[str, Any]] = None
 
@@ -646,7 +701,7 @@ def _normalize_quote_commit_input(raw: Any) -> Dict[str, Any]:
 async def commit_quote(draft_id: str, request: Request):
     engine = get_engine()
     log = logging.getLogger("uvicorn.error")
-    correlation_id = request.headers.get("x-correlation-id") or request.headers.get("X-Correlation-Id") or ""
+    correlation_id = request.headers.get("x-correlation-id") or request.headers.get("X-Correlation-Id") or getattr(request.state, "correlation_id", None) or new_correlation_id()
     
 
     def _strip_leading_qty_uom(s: str) -> str:
@@ -839,6 +894,7 @@ async def commit_quote(draft_id: str, request: Request):
             "draft_id": draft_id,
             "status": "COMMITTED",
             "siigo_quote_response": siigo_saved,
+            "submission": quote_submission_status(draft),
             "note": "Already committed (idempotent). Not calling Siigo again.",
         }
 
@@ -990,171 +1046,18 @@ async def commit_quote(draft_id: str, request: Request):
         # -------------------------
     
 
-    def _validate_customer_payload(payload: Dict[str, Any]) -> List[str]:
-        missing: List[str] = []
+    if body.enqueue:
+        from app.services.quote_queue import enqueue_quote
+        queued = await run_in_threadpool(
+            enqueue_quote, engine, draft_id, correlation_id, quote_payload,
+            body.model_dump(include={"create_customer_if_missing", "customer_create_payload"}),
+        )
+        return JSONResponse(status_code=202, content=queued)
 
-        def has(path: str) -> bool:
-            cur: Any = payload
-            for key in path.split("."):
-                if not isinstance(cur, dict) or key not in cur:
-                    return False
-                cur = cur[key]
-            return cur is not None and cur != "" and cur != []
-
-        if not has("person_type"): missing.append("person_type")
-        if not has("id_type"): missing.append("id_type")
-        if not has("identification"): missing.append("identification")
-        if not has("name"): missing.append("name")
-
-        fr = payload.get("fiscal_responsibilities")
-        if not isinstance(fr, list) or not fr or not isinstance(fr[0], dict) or not fr[0].get("code"):
-            missing.append("fiscal_responsibilities[0].code")
-
-        if not has("address.address"): missing.append("address.address")
-        if not has("address.city.country_code"): missing.append("address.city.country_code")
-        if not has("address.city.state_code"): missing.append("address.city.state_code")
-        if not has("address.city.city_code"): missing.append("address.city.city_code")
-
-        contacts = payload.get("contacts")
-        if not isinstance(contacts, list) or not contacts or not isinstance(contacts[0], dict) or not contacts[0].get("first_name"):
-            missing.append("contacts[0].first_name")
-
-        return missing
-
-    def _normalize_detail(http_exc: HTTPException) -> Dict[str, Any]:
-        detail = http_exc.detail
-        if isinstance(detail, str):
-            try:
-                detail = json.loads(detail)
-            except Exception:
-                return {}
-        if isinstance(detail, dict) and "detail" in detail and isinstance(detail["detail"], dict):
-            detail = detail["detail"]
-        return detail if isinstance(detail, dict) else {}
-
-    def _siigo_code(http_exc: HTTPException) -> str:
-        return (_normalize_detail(http_exc).get("siigoapi_error_code") or "").lower()
-
-    def _is_customer_missing_siigo(http_exc: HTTPException) -> bool:
-        # Siigo: invalid_reference y en el mensaje dice que el customer no existe
-        if _siigo_code(http_exc) != "invalid_reference":
-            return False
-        resp = _normalize_detail(http_exc).get("response") or {}
-        errors = resp.get("Errors") or []
-        for e in errors:
-            msg = (e.get("Message") or "").lower()
-            if "customer doesn't exist" in msg or "customer doesnt exist" in msg:
-                return True
-        return False
-
-    def _is_duplicated_document_siigo(http_exc: HTTPException) -> bool:
-        return _siigo_code(http_exc) == "duplicated_document"
-
-    gw = get_gateway()
-    customer_created: Optional[Dict[str, Any]] = None
-
-    with quote_commit_attempt(engine, draft_id, correlation_id) as attempt_id:
-        try:
-            quote_resp = await run_in_threadpool(
-                gw.create_quote,
-                customer_identification=str(customer_identification),
-                branch_office=int(body.branch_office),
-                document_id=int(document_id),
-                seller=int(seller_id),
-                items=items,
-                date_iso=str(date.today()),
-            )
-
-        except HTTPException as e:
-            log.warning(
-                "quote_commit_upstream_rejected draft_id=%s correlation_id=%s status=%s detail=%s",
-                draft_id,
-                correlation_id,
-                e.status_code,
-                e.detail,
-            )
-            if _is_duplicated_document_siigo(e):
-                raise HTTPException(status_code=409, detail={"code": "SIIGO_DUPLICATED_DOCUMENT", **_normalize_detail(e)})
-
-            if not _is_customer_missing_siigo(e):
-                raise
-
-
-            # 3) Cliente no existe -> si no autorizaste autocreate, error controlado
-            if not body.create_customer_if_missing:
-                raise HTTPException(status_code=409, detail={"code": "CLIENT_NOT_FOUND"})
-
-            if not body.customer_create_payload:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": ["customer_create_payload"]},
-                )
-
-            missing_fields = _validate_customer_payload(body.customer_create_payload)
-            if missing_fields:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": "CLIENT_MISSING_FIELDS", "missing_fields": missing_fields},
-                )
-
-            log.info(
-                "customer_auto_create_attempt",
-                extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
-            )
-            customer_created = await run_in_threadpool(gw.create_client, body.customer_create_payload)
-            log.info(
-                "customer_auto_create_success",
-                extra={"correlation_id": correlation_id, "customer_identification": str(customer_identification)},
-            )
-
-            await run_in_threadpool(time.sleep, 1)
-
-            quote_resp = await run_in_threadpool(
-                gw.create_quote,
-                customer_identification=str(customer_identification),
-                branch_office=int(body.branch_office),
-                document_id=int(document_id),
-                seller=int(seller_id),
-                items=items,
-                date_iso=str(date.today()),
-            )
-
-        # -------------------------
-        # 7) Guardar resultado y marcar COMMITTED
-        # -------------------------
-        up_client_id = ""
-        if isinstance(customer_created, dict):
-            up_client_id = str(customer_created.get("id") or "")
-        if not up_client_id:
-            up_client_id = str((quote_resp.get("customer") or {}).get("id") or "")
-
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    UPDATE drafts
-                    SET status='COMMITTED',
-                        updated_at=now(),
-                        upstream_client_id = COALESCE(NULLIF(upstream_client_id, ''), :up_client_id),
-                        warnings_json = COALESCE(warnings_json, '{}'::jsonb) || CAST(:meta AS jsonb)
-                    WHERE id=:id
-                """),
-                {
-                    "id": draft_id,
-                    "up_client_id": up_client_id,
-                    "meta": json.dumps({
-                        "siigo_quote_response": quote_resp,
-                        "correlation_id": correlation_id,
-                        "quote_commit": {"state": "SUCCEEDED", "attempt_id": attempt_id},
-                    }),
-                },
-            )
-
-    return {
-        "draft_id": draft_id,
-        "status": "COMMITTED",
-        "upstream_client_id": up_client_id,
-        "siigo_quote_response": quote_resp,
-    }
+    from app.services.quote_submission import execute_quote
+    return await run_in_threadpool(
+        execute_quote, engine, get_gateway(), draft_id, correlation_id, quote_payload, body,
+    )
 
 
 # =========================

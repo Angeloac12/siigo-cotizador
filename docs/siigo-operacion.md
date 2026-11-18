@@ -2,6 +2,10 @@
 
 Última actualización: 2026-11-17.
 
+Implementación posterior preparada: [envíos persistentes, estados y verificación
+de cotizaciones](siigo-envios-pendientes.md). Su documentación no confirma un
+despliegue ni concilia intentos anteriores.
+
 ## Referencia rápida
 
 **Estado al cierre del 2026-11-17: el usuario confirmó que ya funcionó**, después

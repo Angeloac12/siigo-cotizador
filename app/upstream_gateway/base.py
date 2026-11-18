@@ -3,6 +3,13 @@ from typing import Protocol, Optional, Dict, Any, List, TypedDict
 
 
 class UpstreamGateway(Protocol):
+    def list_quotes(self, *, identification: str, branch_office: int,
+                    created_start: str, created_end: str, page: int = 1) -> Dict[str, Any]:
+        ...
+
+    def get_quote(self, quotation_id: str) -> Dict[str, Any]:
+        ...
+
     def find_client(self, identification: str) -> Optional[Dict[str, Any]]:
         ...
 
