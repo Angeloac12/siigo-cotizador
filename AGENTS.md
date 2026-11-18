@@ -12,7 +12,9 @@ Este repositorio es el **backend de producción** del cotizador de Siigo.
 - La URL `services.siigo.com/alliances/api/siigoapi-users/v1/sign-in` devolvió 403 con HTML en el incidente. Revisar este antecedente antes de volver a usarla.
 - Autenticación corregida en `902f016`. La actualización posterior de las URLs se hizo en Environment de Render, fuera de Git.
 - Refuerzo de creación: `cf634e4`, después del manejo inicial de timeouts en `c07897c`. Espera de lectura por defecto de 120 s; variable opcional `SIIGO_QUOTE_READ_TIMEOUT_SECONDS` (30–300 s).
-- Cambio posterior preparado, sin confirmar despliegue: [envíos persistentes y verificación](docs/siigo-envios-pendientes.md). Incluye cola en PostgreSQL, estados y confirmación explícita de documentos existentes. Desplegar backend, función de Supabase y frontend en ese orden.
+- Envíos persistentes y verificación: backend integrado en `f46d5bb`, frontend integrado en `5f968ec`. Interfaz publicada y función actualizada confirmadas el 2026-11-18; evidencia y límites en [envíos persistentes y verificación](docs/siigo-envios-pendientes.md). No se crearon cotizaciones reales ni se conciliaron intentos anteriores.
+- El backend de Lovable está administrado por Lovable. Desplegar `siigo-quote` desde sus herramientas internas; no exigir al usuario acceso directo al panel de Supabase ni un token externo. La conexión Git lee `main`; el chat no necesita abrir el PR privado. El workflow externo quedó manual y desactivado por defecto.
+- Comprobación del 2026-11-18 a las 18:00:26 UTC: OPTIONS público devolvió 200 y `x-fn-version: quote_submission_review_v1_2026-11-17`. Esto verifica la versión publicada, no una creación real ni la autenticación de Siigo. Lovable reportó los endpoints nuevos de Render; no hubo comprobación independiente de Events/Live desde esta sesión.
 - Cierre del 2026-11-17: el usuario confirmó que ya funcionó después del último refuerzo. No quedó un identificador de cotización final ni una comprobación independiente de Events/Live. No repetir una creación real solo para volver a verificar este cierre.
 
 ## Trabajo y verificación

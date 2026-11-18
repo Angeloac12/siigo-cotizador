@@ -1,7 +1,29 @@
 # Envíos persistentes y verificación de cotizaciones
 
-Implementación preparada el 2026-11-17. Este documento describe el cambio;
-no acredita su despliegue en Render, Supabase ni Lovable.
+Implementación preparada el 2026-11-17. Publicación de interfaz y función
+confirmada el 2026-11-18 con la evidencia y los límites siguientes.
+
+## Estado verificado del 2026-11-18
+
+**Cierre de publicación documentado.** Interfaz nueva publicada y función
+actualizada verificadas. El usuario solicitó cerrar la sesión tras estas
+comprobaciones; no se requiere otra creación real para volver a verificarlas.
+
+- Backend: PR #1 integrado en `f46d5bb`. Lovable reportó disponibles los endpoints
+  `quote/submission`, `quote/verify` y `quote/confirm`. No se obtuvo una comprobación
+  independiente de Events/Live de Render.
+- Frontend: PR #1 integrado en `5f968ec`. La web pública
+  `https://siigo-quote-quick.lovable.app/` sirvió `/assets/index-BgiU7oNv.js`
+  con los controles de verificación, confirmación y recuperación de envíos.
+- Función: OPTIONS a
+  `https://tuljkmtloqmoksnsmktx.supabase.co/functions/v1/siigo-quote`
+  devolvió **200** y `x-fn-version: quote_submission_review_v1_2026-11-17`.
+  Fecha de la respuesta: **2026-11-18 18:00:26 UTC**.
+- `deeacd4`, comprobado como HEAD del frontend, solo actualizó `deno.lock`.
+  La evidencia de publicación de la función es OPTIONS, no ese commit.
+- No se comprobó un envío autenticado a Siigo ni se crearon cotizaciones reales.
+  No repetir creaciones solo para verificar este cierre. Los intentos antiguos
+  con resultado incierto siguen requiriendo revisión operativa.
 
 ## Comportamiento
 
@@ -91,6 +113,21 @@ Esto incluye el timeout aportado del borrador
 crearon cotizaciones reales durante esta implementación.
 
 ## Despliegue y límites
+
+Este proyecto utiliza el backend administrado por Lovable. La función se
+despliega desde el chat de Build de Lovable, conservando los secretos existentes;
+publicar la web es una acción aparte. No es necesario que el usuario pueda entrar
+al panel de Supabase. El token externo de GitHub Actions devolvía 403 por permisos:
+no continuar pidiéndolo ni reintentando esa vía para este proyecto. El workflow
+del frontend quedó solo manual y requiere activar explícitamente
+`ENABLE_EXTERNAL_SUPABASE_DEPLOY=true`; se mantiene desactivado para Lovable.
+La conexión Git de Lovable lee main y permite sincronizar los archivos con
+**Re-check**, aunque su chat no pueda abrir el PR privado.
+
+Para publicar cambios exclusivamente documentales de este backend sin reiniciar
+el servicio, el mensaje del commit puede incluir `[skip render]`, conforme a la
+[documentación de Render](https://render.com/docs/deploys#skipping-an-auto-deploy).
+Esto no debe usarse para omitir el despliegue de cambios de ejecución necesarios.
 
 Orden: backend en Render y comprobar Live; después la función `siigo-quote`
 en Supabase; finalmente el frontend de Lovable. No activar el frontend nuevo

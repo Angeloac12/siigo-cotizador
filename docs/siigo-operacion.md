@@ -1,10 +1,13 @@
 # Operación del cotizador y diagnóstico de Siigo
 
-Última actualización: 2026-11-17.
+Última actualización: 2026-11-18.
 
-Implementación posterior preparada: [envíos persistentes, estados y verificación
-de cotizaciones](siigo-envios-pendientes.md). Su documentación no confirma un
-despliegue ni concilia intentos anteriores.
+Implementación posterior: [envíos persistentes, estados y verificación
+de cotizaciones](siigo-envios-pendientes.md). El 2026-11-18 se confirmaron la
+interfaz publicada y la versión nueva de la función mediante OPTIONS. El backend
+está integrado en main y Lovable reportó los endpoints disponibles; no se
+comprobó Events/Live de Render de forma independiente. No se crearon cotizaciones
+reales ni se conciliaron los intentos anteriores.
 
 ## Referencia rápida
 
