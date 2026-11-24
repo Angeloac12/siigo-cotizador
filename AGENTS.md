@@ -15,6 +15,7 @@ Este repositorio es el **backend de producción** del cotizador de Siigo.
 - Envíos persistentes y verificación: backend integrado en `f46d5bb`, frontend integrado en `5f968ec`. Interfaz publicada y función actualizada confirmadas el 2026-11-18; evidencia y límites en [envíos persistentes y verificación](docs/siigo-envios-pendientes.md). No se crearon cotizaciones reales ni se conciliaron intentos anteriores.
 - El backend de Lovable está administrado por Lovable. Desplegar `siigo-quote` desde sus herramientas internas; no exigir al usuario acceso directo al panel de Supabase ni un token externo. La conexión Git lee `main`; el chat no necesita abrir el PR privado. El workflow externo quedó manual y desactivado por defecto.
 - Comprobación del 2026-11-18 a las 18:00:26 UTC: OPTIONS público devolvió 200 y `x-fn-version: quote_submission_review_v1_2026-11-17`. Esto verifica la versión publicada, no una creación real ni la autenticación de Siigo. Lovable reportó los endpoints nuevos de Render; no hubo comprobación independiente de Events/Live desde esta sesión.
+- NIT bloqueado tras un envío: corregido en el frontend (PR #2, integrado en `848e6ac`) y publicado el 2026-11-23. El usuario confirmó el 2026-11-24 que funciona. Causa, lista **Envíos por confirmar**, bloqueo por NIT y límites en [envíos persistentes](docs/siigo-envios-pendientes.md#formulario-bloqueado-tras-un-envío-2026-11-23). No cambió el backend.
 - Cierre del 2026-11-17: el usuario confirmó que ya funcionó después del último refuerzo. No quedó un identificador de cotización final ni una comprobación independiente de Events/Live. No repetir una creación real solo para volver a verificar este cierre.
 
 ## Trabajo y verificación
@@ -32,4 +33,6 @@ Este repositorio es el **backend de producción** del cotizador de Siigo.
 - Una prueba de creación con `dry_run=false` genera una cotización real; utilizar los datos autorizados por el usuario.
 - En la sesión de este incidente, Render usaba el plan gratuito y no permitía Shell. No proponer una actualización de plan solo para ejecutar la prueba.
 - Mantener claves y tokens fuera de documentos, commits y salidas de diagnóstico.
-- La optimización de `/match` sigue como mejora independiente; no se abordó en estos arreglos.
+- La optimización de `/match` sigue como mejora independiente; no se abordó en estos arreglos. Último dato: 59,394 s con 30 ítems el 2026-11-23.
+- Pendientes abiertos: optimizar `/match` y conciliar en Siigo los intentos antiguos con timeout (`1b2bc4df-5ff8-4ad6-9f3e-37f0cc795e90` y `5a407411-1c8e-44b9-a2ca-a5b6988e3b38`).
+- Frontend: la lista **Envíos por confirmar** y la referencia del último borrador viven en `localStorage`. Un formulario bloqueado debe ofrecer **Nueva cotización**; no pedir al usuario modo incógnito ni borrar datos del navegador.

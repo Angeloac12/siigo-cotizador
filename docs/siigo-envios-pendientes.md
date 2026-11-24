@@ -25,6 +25,55 @@ comprobaciones; no se requiere otra creación real para volver a verificarlas.
   No repetir creaciones solo para verificar este cierre. Los intentos antiguos
   con resultado incierto siguen requiriendo revisión operativa.
 
+## Formulario bloqueado tras un envío (2026-11-23)
+
+**Cerrado.** El usuario confirmó el 2026-11-24 que el NIT volvió a ser editable
+en su navegador habitual, sin modo incógnito.
+
+Síntoma: después de enviar una cotización, el campo NIT y **Generar cotización**
+quedaban deshabilitados al volver a la página. Causa en el frontend: la referencia
+del último borrador guardada en el navegador solo se borraba con **Generar
+cotización**, que estaba deshabilitado para un borrador ya enviado. No había
+otra forma de empezar. Los logs coincidían: después del reinicio solo hubo
+lecturas de borradores, sin intentos de guardar ni de enviar.
+
+Corrección: frontend PR #2, commit `3ebadc4`, integrado en `848e6ac`. No cambió
+el backend, la función `siigo-quote` ni las reservas.
+
+- Un borrador `SUCCEEDED` libera el formulario. Al abrir la página, una referencia
+  antigua de una cotización creada se descarta sola.
+- **Nueva cotización** aparece sobre el formulario cuando el borrador visible ya
+  fue enviado.
+- `QUEUED`, `IN_PROGRESS` y `UNKNOWN` pasan a **Envíos por confirmar**, con
+  **Revisar**. Esa lista vive en el navegador, en la clave
+  `siigo-submission:<usuario>:<organización>:held`. No bloquea a otros clientes.
+- No se crea otra cotización para un NIT con un envío por confirmar. El NIT se
+  compara sin puntos, espacios ni dígito de verificación. Si un envío de la lista
+  no puede consultarse, tampoco se crea, y se pide intentarlo de nuevo.
+- Si el backend no responde al recuperar el borrador, el formulario sigue
+  disponible y el envío queda en la lista. Un borrador inexistente (404) se descarta.
+- Una renovación del token de sesión ya no sobrescribe el NIT que se está escribiendo.
+
+Límites: la lista es por navegador y no deduplica entre usuarios o equipos. Los
+intentos antiguos sin payload guardado no tienen NIT para comparar; aparecen en
+la lista, pero no bloquean por cliente.
+
+Validación: 29 pruebas de frontend pasaron, 11 nuevas, además de TypeScript y
+build. ESLint conserva los mismos 16 errores previos de `any`. El 2026-11-23,
+hacia las 22:30 UTC, la web pública servía `/assets/index-DwN0Bkfm.js` con los
+textos nuevos. OPTIONS de la función seguía con
+`x-fn-version: quote_submission_review_v1_2026-11-17`, como se esperaba. El
+agente no tenía sesión en el cotizador. La prueba con sesión fue del usuario.
+No se crearon cotizaciones reales para esta corrección.
+
+Logs del 2026-11-23, de 21:34 a 22:05 UTC, aportados por el usuario: sin
+respuestas 4xx ni 5xx. El borrador `4752470d-0377-42bf-b04f-66b5b75b1f37` (30
+ítems) se encoló con 202 y registró `quote_commit_succeeded` en 4,992 s. Es
+evidencia de log; el agente no consultó el documento en Siigo. `/match` tardó
+59,394 s. Hubo un apagado ordenado justo 15 minutos después de la última
+petición. Coincide con la suspensión por inactividad del plan gratuito, sin
+confirmar la causa. El servicio volvió al llegar la siguiente petición.
+
 ## Comportamiento
 
 El frontend solicita el envío con `dry_run=false` y `enqueue=true`. El backend

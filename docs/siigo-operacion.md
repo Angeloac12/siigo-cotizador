@@ -1,6 +1,10 @@
 # Operación del cotizador y diagnóstico de Siigo
 
-Última actualización: 2026-11-18.
+Última actualización: 2026-11-24.
+
+Corrección del 2026-11-23: el NIT bloqueado después de un envío era un fallo del
+frontend, ya publicado y confirmado por el usuario. Detalle en [formulario
+bloqueado tras un envío](siigo-envios-pendientes.md#formulario-bloqueado-tras-un-envío-2026-11-23).
 
 Implementación posterior: [envíos persistentes, estados y verificación
 de cotizaciones](siigo-envios-pendientes.md). El 2026-11-18 se confirmaron la
